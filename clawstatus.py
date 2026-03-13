@@ -82,6 +82,7 @@ _dash_lock = threading.Lock()
 _daily_tokens_lock = threading.Lock()
 _models_lock = threading.Lock()
 _memory_lock = threading.Lock()
+_config_lock = threading.Lock()
 _bg_warmup_started = False
 _dash_refreshing = False
 _status_refreshing = False
@@ -442,6 +443,178 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except Exception:
         return 0
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _invalidate_dashboard_cache() -> None:
+    with _dash_lock:
+        _dash_cache.update({"ts": 0.0, "data": None})
+    with _models_lock:
+        _models_cache.update({"ts": 0.0, "data": None, "days": 0})
+
+
+def _iter_configured_model_ids(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure(mid: Any, display_name: Optional[str] = None, provider_hint: Optional[str] = None) -> None:
+        model_id = str(mid or "").strip()
+        if not model_id:
+            return
+        current = rows.get(model_id, {"id": model_id, "name": model_id, "provider": provider_hint or "-"})
+        if display_name:
+            current["name"] = str(display_name).strip() or current["name"]
+        if provider_hint:
+            current["provider"] = provider_hint
+        elif current.get("provider") in {None, "", "-"} and "/" in model_id:
+            current["provider"] = model_id.split("/", 1)[0]
+        rows[model_id] = current
+
+    providers = ((cfg.get("models") or {}).get("providers") or {}) if isinstance(cfg, dict) else {}
+    if isinstance(providers, dict):
+        for provider_id, provider_cfg in providers.items():
+            if not isinstance(provider_cfg, dict):
+                continue
+            for model in provider_cfg.get("models") or []:
+                if not isinstance(model, dict):
+                    continue
+                model_leaf = str(model.get("id") or "").strip()
+                if not model_leaf:
+                    continue
+                _ensure(f"{provider_id}/{model_leaf}", model.get("name"), str(provider_id))
+
+    agents_cfg = (cfg.get("agents") or {}) if isinstance(cfg, dict) else {}
+    defaults = agents_cfg.get("defaults") or {}
+    if isinstance(defaults, dict):
+        for mid in (defaults.get("models") or {}).keys():
+            _ensure(mid)
+        default_model = defaults.get("model") or {}
+        if isinstance(default_model, dict):
+            _ensure(default_model.get("primary"))
+            for mid in default_model.get("fallbacks") or []:
+                _ensure(mid)
+
+    for agent in agents_cfg.get("list") or []:
+        if not isinstance(agent, dict):
+            continue
+        model_cfg = agent.get("model")
+        if isinstance(model_cfg, dict):
+            _ensure(model_cfg.get("primary"))
+            for mid in model_cfg.get("fallbacks") or []:
+                _ensure(mid)
+        elif isinstance(model_cfg, str):
+            _ensure(model_cfg)
+
+    jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
+    jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        payload = job.get("payload") or {}
+        if isinstance(payload, dict):
+            _ensure(payload.get("model"))
+
+    return sorted(rows.values(), key=lambda x: x["id"])
+
+
+def _available_models_payload() -> Tuple[List[Dict[str, Any]], set[str]]:
+    cfg = _safe_read_json(OPENCLAW_CONFIG, {})
+    rows = _iter_configured_model_ids(cfg)
+    return rows, {str(row.get("id") or "") for row in rows}
+
+
+def _agent_model_map_from_config() -> Dict[str, str]:
+    cfg = _safe_read_json(OPENCLAW_CONFIG, {})
+    agents_cfg = (cfg.get("agents") or {}) if isinstance(cfg, dict) else {}
+    result: Dict[str, str] = {}
+    for agent in agents_cfg.get("list") or []:
+        if not isinstance(agent, dict):
+            continue
+        aid = str(agent.get("id") or "").strip()
+        if not aid:
+            continue
+        model_cfg = agent.get("model")
+        if isinstance(model_cfg, dict):
+            result[aid] = str(model_cfg.get("primary") or "").strip()
+        elif isinstance(model_cfg, str):
+            result[aid] = model_cfg.strip()
+    return result
+
+
+def _current_agent_model(agent_id: str, status_agent: Optional[Dict[str, Any]] = None) -> str:
+    cfg_map = _agent_model_map_from_config()
+    current = str(cfg_map.get(agent_id) or "").strip()
+    if current:
+        return current
+    if isinstance(status_agent, dict):
+        return str(status_agent.get("model") or "").strip()
+    return ""
+
+
+def _update_agent_model(agent_id: str, model_id: str) -> Dict[str, Any]:
+    with _config_lock:
+        cfg = _safe_read_json(OPENCLAW_CONFIG, {})
+        available_models, valid_ids = _available_models_payload()
+        if model_id not in valid_ids:
+            raise ValueError("invalid model")
+
+        agents_cfg = (cfg.get("agents") or {}) if isinstance(cfg, dict) else {}
+        agent_list = agents_cfg.get("list") or []
+        if not isinstance(agent_list, list):
+            raise KeyError(agent_id)
+
+        target = None
+        for agent in agent_list:
+            if isinstance(agent, dict) and str(agent.get("id") or "") == agent_id:
+                target = agent
+                break
+        if target is None:
+            raise KeyError(agent_id)
+
+        model_cfg = target.get("model")
+        if isinstance(model_cfg, dict):
+            model_cfg["primary"] = model_id
+        else:
+            target["model"] = {"primary": model_id}
+
+        _write_json_atomic(OPENCLAW_CONFIG, cfg)
+
+    _invalidate_dashboard_cache()
+    return {"agentId": agent_id, "currentModel": model_id, "availableModels": available_models}
+
+
+def _update_cron_model(job_id: str, model_id: str) -> Dict[str, Any]:
+    with _config_lock:
+        jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
+        jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
+        available_models, valid_ids = _available_models_payload()
+        if model_id not in valid_ids:
+            raise ValueError("invalid model")
+
+        target = None
+        for job in jobs:
+            if isinstance(job, dict) and str(job.get("id") or "") == job_id:
+                target = job
+                break
+        if target is None:
+            raise KeyError(job_id)
+
+        payload = target.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+            target["payload"] = payload
+        payload["model"] = model_id
+
+        _write_json_atomic(CRON_JOBS_PATH, jobs_payload)
+
+    _invalidate_dashboard_cache()
+    return {"jobId": job_id, "currentModel": model_id, "availableModels": available_models}
 
 
 def _actual_consumed_tokens(input_tokens: Any, output_tokens: Any, cache_read_tokens: Any) -> int:
@@ -1383,9 +1556,39 @@ def _build_cron_monitor_text(job: Dict[str, Any]) -> str:
     return txt[:7000]
 
 
+def _describe_schedule(schedule: Any) -> str:
+    if not isinstance(schedule, dict):
+        return "-"
+
+    kind = str(schedule.get("kind") or "").strip().lower()
+    if kind == "every":
+        every_ms = _safe_int(schedule.get("everyMs"))
+        if every_ms <= 0:
+            return "every"
+        total_sec = max(1, every_ms // 1000)
+        if total_sec % 86400 == 0:
+            return f"每{total_sec // 86400}天"
+        if total_sec % 3600 == 0:
+            return f"每{total_sec // 3600}小时"
+        if total_sec % 60 == 0:
+            return f"每{total_sec // 60}分钟"
+        return f"每{total_sec}秒"
+
+    if kind == "cron":
+        expr = str(schedule.get("expr") or "").strip() or "-"
+        tz = str(schedule.get("tz") or "").strip()
+        return f"{expr} ({tz})" if tz else expr
+
+    if kind == "at":
+        return str(schedule.get("at") or "-")
+
+    return kind or "-"
+
+
 def _collect_cron_data() -> Dict[str, Any]:
     jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
     jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
+    available_models, _ = _available_models_payload()
 
     running = 0
     normalized_jobs = []
@@ -1433,6 +1636,8 @@ def _collect_cron_data() -> Dict[str, Any]:
                 "nextRunAtMs": state.get("nextRunAtMs"),
                 "lastDurationMs": state.get("lastDurationMs"),
                 "schedule": job.get("schedule") or {},
+                "scheduleText": _describe_schedule(job.get("schedule") or {}),
+                "currentModel": str(((job.get("payload") or {}) if isinstance(job.get("payload"), dict) else {}).get("model") or "").strip() or "-",
             }
         )
 
@@ -1448,6 +1653,7 @@ def _collect_cron_data() -> Dict[str, Any]:
         "enabled": enabled_count,
         "disabled": disabled_count,
         "running": running,
+        "availableModels": available_models,
         "jobs": normalized_jobs,
     }
 
@@ -1490,6 +1696,8 @@ def _build_channels_from_status(status_data: Dict[str, Any]) -> List[Dict[str, A
 def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any]) -> Dict[str, Any]:
     agents_block = status_data.get("agents", {}) if isinstance(status_data, dict) else {}
     heartbeat_block = status_data.get("heartbeat", {}) if isinstance(status_data, dict) else {}
+    agent_model_map = _agent_model_map_from_config()
+    available_models, _ = _available_models_payload()
 
     hb_map: Dict[str, Dict[str, Any]] = {}
     for row in heartbeat_block.get("agents", []) if isinstance(heartbeat_block, dict) else []:
@@ -1541,6 +1749,7 @@ def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any])
                 "subagentsRunning": sub_running,
                 "heartbeatEnabled": bool(hb.get("enabled", False)),
                 "heartbeatEvery": hb.get("every") or "disabled",
+                "currentModel": str(agent_model_map.get(aid) or a.get("model") or "-").strip() or "-",
             }
         )
 
@@ -1549,6 +1758,7 @@ def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any])
     return {
         "total": len(result_agents),
         "running": running_count,
+        "availableModels": available_models,
         "agents": result_agents,
     }
 
@@ -1879,6 +2089,27 @@ def create_app() -> Flask:
         out["_sourceTimestamps"] = data.get("sourceTimestamps", {})
         return jsonify(out)
 
+    @app.post("/api/agents/<agent_id>/model")
+    def api_agent_model_update(agent_id: str):
+        auth_resp = _require_auth(required_token)
+        if auth_resp is not None:
+            return auth_resp
+        payload = request.get_json(silent=True) or {}
+        model_id = str(payload.get("model") or "").strip()
+        if not model_id:
+            return jsonify({"error": "missing model"}), 400
+        try:
+            result = _update_agent_model(agent_id, model_id)
+        except KeyError:
+            return jsonify({"error": "agent not found", "agentId": agent_id}), 404
+        except ValueError:
+            return jsonify({"error": "invalid model", "model": model_id}), 400
+        except PermissionError as e:
+            return jsonify({"error": f"write failed: {e}"}), 500
+        except OSError as e:
+            return jsonify({"error": f"write failed: {e}"}), 500
+        return jsonify(result)
+
     @app.get("/api/crons")
     def api_crons():
         auth_resp = _require_auth(required_token)
@@ -1889,6 +2120,27 @@ def create_app() -> Flask:
         out["_sourceLagsMs"] = data.get("sourceLagsMs", {})
         out["_sourceTimestamps"] = data.get("sourceTimestamps", {})
         return jsonify(out)
+
+    @app.post("/api/crons/<job_id>/model")
+    def api_cron_model_update(job_id: str):
+        auth_resp = _require_auth(required_token)
+        if auth_resp is not None:
+            return auth_resp
+        payload = request.get_json(silent=True) or {}
+        model_id = str(payload.get("model") or "").strip()
+        if not model_id:
+            return jsonify({"error": "missing model"}), 400
+        try:
+            result = _update_cron_model(job_id, model_id)
+        except KeyError:
+            return jsonify({"error": "cron not found", "jobId": job_id}), 404
+        except ValueError:
+            return jsonify({"error": "invalid model", "model": model_id}), 400
+        except PermissionError as e:
+            return jsonify({"error": f"write failed: {e}"}), 500
+        except OSError as e:
+            return jsonify({"error": f"write failed: {e}"}), 500
+        return jsonify(result)
 
     @app.get("/api/cron-monitor/<job_id>")
     def api_cron_monitor(job_id: str):
@@ -2053,16 +2305,13 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       backdrop-filter: blur(8px);
       z-index: 10;
       display: grid;
-      grid-template-columns: auto 1fr auto;
+      grid-template-columns: auto 1fr;
       align-items: center;
       gap: 12px;
     }}
     h1 {{ margin: 0; font-size: 22px; font-weight: 700; justify-self: start; }}
     .wrap {{ padding: 14px 24px 28px; max-width: 1500px; margin: 0 auto; }}
     .nav {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 0; justify-content: center; }}
-    .site-nav {{ display:flex; gap:8px; justify-self:end; }}
-    .site-link {{ display:inline-flex; align-items:center; border:1px solid var(--line); background: var(--card); color: var(--text); border-radius: 8px; padding: 8px 12px; font-size:13px; text-decoration:none; }}
-    .site-link:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
     .nav-tab {{ border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; }}
     .nav-tab.active {{ border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }}
     .page {{ display: none; }}
@@ -2090,6 +2339,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .monitor-content {{ white-space: pre-wrap; font-size:12px; line-height:1.5; max-height:300px; overflow:auto; color: var(--text); }}
     .btn-monitor {{ border:1px solid var(--line); background:var(--bg2); color:var(--text); border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; }}
     .btn-monitor:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
+    .model-cell {{ min-width: 260px; }}
+    .model-switcher {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+    .model-select {{ min-width: 190px; max-width: 100%; border:1px solid var(--line); background:var(--bg2); color:var(--text); border-radius:8px; padding:6px 10px; font-size:12px; }}
+    .model-status {{ color: var(--muted); font-size: 12px; }}
     .daily-chart {{ display:flex; align-items:flex-end; justify-content:space-between; gap:10px; min-height:240px; padding: 10px 6px 0; overflow: hidden; }}
     .daily-item {{ flex: 1 1 0; min-width: 44px; max-width: 72px; text-align:center; }}
     .daily-bar-wrap {{ height: 160px; display:flex; align-items:flex-end; justify-content:center; }}
@@ -2104,7 +2357,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .daily-list {{ margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }}
     #flow-svg {{ width: 100%; height: 240px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }}
     #boot-overlay {{ display: none; }}
-    @media (max-width: 1200px) {{ header {{ grid-template-columns: 1fr; }} h1 {{ justify-self: center; }} .nav {{ justify-content: center; }} .site-nav {{ justify-self: center; }} }}
+    @media (max-width: 1200px) {{ header {{ grid-template-columns: 1fr; }} h1 {{ justify-self: center; }} .nav {{ justify-content: center; }} }}
     @media (max-width: 1000px) {{ .grid {{ grid-template-columns: repeat(2,minmax(160px,1fr)); }} .monitor-grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -2118,10 +2371,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <button class="nav-tab" data-page="usage">Tokens</button>
       <button class="nav-tab" data-page="memory">Memory</button>
     </div>
-    <nav class="site-nav" aria-label="站点导航">
-      <a class="site-link" href="https://never.ink" target="_blank" rel="noopener noreferrer">博客</a>
-      <a class="site-link" href="#">摄影</a>
-    </nav>
   </header>
   <div class="wrap">
 
@@ -2130,7 +2379,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <div class="panel">
         <h3 style="margin:4px 0 8px">Agent 概览 <span class="pill">含子 Agent</span><span class="pill" id="cd-agents">60秒后刷新</span></h3>
         <table class="table table-hover align-middle mb-0">
-          <thead><tr><th>Agent</th><th>运行</th><th>Sub-Agent</th><th>Sessions</th><th>Heartbeat</th></tr></thead>
+          <thead><tr><th>Agent</th><th>运行</th><th>Sub-Agent</th><th>Sessions</th><th>Heartbeat</th><th>当前模型</th><th>切换模型</th></tr></thead>
           <tbody id="agents-body"></tbody>
         </table>
       </div>
@@ -2157,18 +2406,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     <section id="page-crons" class="page">
       <div class="panel">
         <h3 style="margin:4px 0 8px">Cron 任务 <span class="pill" id="cd-crons">60秒后刷新</span></h3>
-        <div class="monitor-grid" id="cron-monitor-panels">
-          <div class="monitor-box">
-            <div class="monitor-title">当前监督任务</div>
-            <div id="cron-monitor-list"></div>
-          </div>
-          <div class="monitor-box">
-            <div class="monitor-title" id="cron-monitor-detail-title">执行内容</div>
-            <div class="monitor-content" id="cron-monitor-detail">请选择左侧任务查看执行内容。</div>
-          </div>
-        </div>
         <table class="table table-hover align-middle mb-0">
-          <thead><tr><th>任务</th><th>Agent</th><th>启用</th><th>运行中</th><th>上次状态</th><th>上次耗时</th><th>下次执行</th><th>操作</th></tr></thead>
+          <thead><tr><th>任务</th><th>Agent</th><th>触发频率</th><th>启用</th><th>运行中</th><th>当前模型</th><th>上次状态</th><th>上次耗时</th><th>下次执行</th><th>切换模型</th></tr></thead>
           <tbody id="crons-body"></tbody>
         </table>
       </div>
@@ -2226,6 +2465,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     const SERVER_TOKEN = '{auth_token or ''}';
     const $ = (s) => document.querySelector(s);
     const fmtNum = (n) => (n ?? 0).toLocaleString();
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>\"']/g, (ch) => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }})[ch] || ch);
     const fmtM = (n) => {{
       const v = Number(n || 0) / 1_000_000;
       if (v >= 100) return v.toFixed(0) + 'M';
@@ -2263,6 +2503,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const r = await fetch(url, {{ headers }});
       if (!r.ok) throw new Error(url + ' -> HTTP ' + r.status);
       return r.json();
+    }}
+
+    async function postJson(url, body, headers) {{
+      const r = await fetch(url, {{
+        method: 'POST',
+        headers: Object.assign({{ 'Content-Type': 'application/json' }}, headers || {{}}),
+        body: JSON.stringify(body || {{}}),
+      }});
+      const data = await r.json().catch(() => ({{}}));
+      if (!r.ok) throw new Error((data && data.error) ? data.error : (url + ' -> HTTP ' + r.status));
+      return data;
     }}
 
     const dashboardState = {{
@@ -2443,6 +2694,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       `).join('');
 
       const agents = (d.agents || {{}}).agents || [];
+      const agentModels = (d.agents || {{}}).availableModels || [];
       $('#agents-body').innerHTML = agents.map(a => `
         <tr>
           <td>${{a.id}}</td>
@@ -2450,11 +2702,15 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{a.subagentsRunning}} / ${{a.subagentsTotal}}</td>
           <td>${{fmtNum(a.sessionsCount)}}</td>
           <td>${{a.heartbeatEnabled ? 'on (' + (a.heartbeatEvery || '-') + ')' : 'off'}}</td>
+          <td>${{escapeHtml(a.currentModel || '-')}}</td>
+          <td class="model-cell">${{renderModelSwitcher('agent', a.id, a.currentModel, agentModels)}}</td>
         </tr>
-      `).join('') || '<tr><td colspan="5" class="meta">暂无数据</td></tr>';
+      `).join('') || '<tr><td colspan="7" class="meta">暂无数据</td></tr>';
+      bindModelSwitchers('agent');
 
 
       const crons = (d.crons || {{}}).jobs || [];
+      const cronModels = (d.crons || {{}}).availableModels || [];
       cronMap.clear();
       crons.forEach(c => cronMap.set(c.id, c));
 
@@ -2463,24 +2719,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         <tr>
           <td>${{c.name}}</td>
           <td>${{c.agentId}}</td>
+          <td>${{escapeHtml(c.scheduleText || '-')}}</td>
           <td>${{c.enabled ? '<span class="ok">yes</span>' : '<span class="warn">no</span>'}}</td>
           <td>${{c.running ? '<span class="ok">running</span>' : '-'}}</td>
+          <td>${{escapeHtml(c.currentModel || '-')}}</td>
           <td>${{c.lastStatus || '-'}}</td>
           <td>${{c.lastDurationMs ? Math.round(c.lastDurationMs/1000)+'s' : '-'}}</td>
           <td>${{fmtTime(c.nextRunAtMs)}}</td>
-          <td><button class="btn-monitor" data-cron-id="${{c.id}}">监控</button></td>
+          <td class="model-cell">${{renderModelSwitcher('cron', c.id, c.currentModel, cronModels)}}</td>
         </tr>
-      `).join('') || '<tr><td colspan="8" class="meta">暂无数据</td></tr>';
-
-      cronsBody.querySelectorAll('.btn-monitor').forEach(btn => {{
-        btn.addEventListener('click', () => showCronMonitor(btn.getAttribute('data-cron-id')));
-      }});
-
-      if (!selectedCronId && crons.length > 0) {{
-        selectedCronId = crons[0].id;
-      }}
-      renderCronMonitorList(crons);
-      showCronMonitor(selectedCronId);
+      `).join('') || '<tr><td colspan="10" class="meta">暂无数据</td></tr>';
+      bindModelSwitchers('cron');
 
       const daily = (d.models || {{}}).dailyTokens || [];
       renderDailyChart(daily);
@@ -2558,6 +2807,72 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       }} catch (e) {{
         detailEl.textContent = '监控内容加载失败，请稍后重试。';
       }}
+    }}
+
+    function renderModelSwitcher(kind, entityId, currentModel, models) {{
+      const items = Array.isArray(models) ? models : [];
+      const current = String(currentModel || '');
+      const seen = new Set();
+      const opts = [];
+
+      items.forEach((row) => {{
+        const id = String((row && row.id) || '').trim();
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        const label = String((row && row.name) || id).trim() || id;
+        const provider = String((row && row.provider) || '').trim();
+        const text = provider && label !== id ? `${{label}} [${{id}}]` : (label || id);
+        opts.push(`<option value="${{escapeHtml(id)}}" ${{id === current ? 'selected' : ''}}>${{escapeHtml(text)}}</option>`);
+      }});
+
+      if (current && !seen.has(current)) {{
+        opts.unshift(`<option value="${{escapeHtml(current)}}" selected>${{escapeHtml(current)}} (current)</option>`);
+      }}
+
+      return `
+        <div class="model-switcher" data-kind="${{escapeHtml(kind)}}" data-id="${{escapeHtml(entityId)}}">
+          <select class="model-select">${{opts.join('')}}</select>
+          <button class="btn-monitor btn-model-save">保存</button>
+          <span class="model-status"></span>
+        </div>
+      `;
+    }}
+
+    function bindModelSwitchers(kind) {{
+      document.querySelectorAll(`.model-switcher[data-kind="${{kind}}"]`).forEach((node) => {{
+        const button = node.querySelector('.btn-model-save');
+        const select = node.querySelector('.model-select');
+        const status = node.querySelector('.model-status');
+        if (!button || !select || !status) return;
+        button.onclick = async () => {{
+          const entityId = node.getAttribute('data-id');
+          const model = select.value;
+          const headers = {{}};
+          if (token()) headers['Authorization'] = 'Bearer ' + token();
+          button.disabled = true;
+          status.textContent = '保存中...';
+          try {{
+            const url = kind === 'agent'
+              ? `/api/agents/${{encodeURIComponent(entityId)}}/model`
+              : `/api/crons/${{encodeURIComponent(entityId)}}/model`;
+            await postJson(url, {{ model }}, headers);
+            status.textContent = '已保存';
+            if (kind === 'agent') {{
+              await refreshOne('agents', true);
+            }} else {{
+              await refreshOne('crons', true);
+            }}
+          }} catch (e) {{
+            status.textContent = '保存失败';
+            console.warn('model switch failed', e);
+          }} finally {{
+            button.disabled = false;
+            setTimeout(() => {{
+              if (status.textContent === '已保存') status.textContent = '';
+            }}, 1500);
+          }}
+        }};
+      }});
     }}
 
     function fmtBytes(n) {{
