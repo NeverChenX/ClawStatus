@@ -574,6 +574,42 @@ def _current_agent_model(agent_id: str, status_agent: Optional[Dict[str, Any]] =
     return ""
 
 
+def _restart_openclaw() -> Tuple[bool, str]:
+    """尝试重启 openclaw 服务。依次尝试 systemctl --user → openclaw restart。
+    返回 (success, method_used)。"""
+    # 1. 尝试 systemctl user service
+    for svc in ("openclaw.service", "openclaw"):
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "restart", svc],
+                capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                return True, f"systemctl --user restart {svc}"
+        except FileNotFoundError:
+            break  # systemctl 不存在，跳过后续 systemctl 尝试
+        except subprocess.TimeoutExpired:
+            pass
+
+    # 2. 尝试 openclaw restart 命令
+    openclaw_bin = (
+        os.environ.get("OPENCLAW_BIN")
+        or shutil.which("openclaw")
+        or str(HOME / ".npm-global" / "bin" / "openclaw")
+    )
+    try:
+        proc = subprocess.run(
+            [openclaw_bin, "restart"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            return True, "openclaw restart"
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    return False, "no restart method succeeded"
+
+
 def _update_agent_model(agent_id: str, model_id: str) -> Dict[str, Any]:
     with _config_lock:
         cfg = _safe_read_json(OPENCLAW_CONFIG, {})
@@ -603,35 +639,72 @@ def _update_agent_model(agent_id: str, model_id: str) -> Dict[str, Any]:
         _write_json_atomic(OPENCLAW_CONFIG, cfg)
 
     _invalidate_dashboard_cache()
-    return {"agentId": agent_id, "currentModel": model_id, "availableModels": available_models}
+    restarted, restart_method = _restart_openclaw()
+    return {
+        "agentId": agent_id,
+        "currentModel": model_id,
+        "availableModels": available_models,
+        "restartTriggered": restarted,
+        "restartMethod": restart_method,
+    }
+
+
+def _trigger_cron_run(job_id: str) -> Dict[str, Any]:
+    """Trigger a cron job to run immediately via `openclaw cron run <id>`."""
+    jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
+    jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
+    found = any(
+        isinstance(j, dict) and str(j.get("id") or "") == job_id
+        for j in jobs
+    )
+    if not found:
+        raise KeyError(job_id)
+    try:
+        subprocess.Popen(
+            ["openclaw", "cron", "run", job_id, "--timeout", "30000"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {"jobId": job_id, "triggered": True}
+    except Exception as e:
+        return {"jobId": job_id, "triggered": False, "error": str(e)}
 
 
 def _update_cron_model(job_id: str, model_id: str) -> Dict[str, Any]:
-    with _config_lock:
-        jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
-        jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
-        available_models, valid_ids = _available_models_payload()
-        if model_id not in valid_ids:
-            raise ValueError("invalid model")
+    available_models, valid_ids = _available_models_payload()
+    if model_id not in valid_ids:
+        raise ValueError("invalid model")
 
-        target = None
-        for job in jobs:
-            if isinstance(job, dict) and str(job.get("id") or "") == job_id:
-                target = job
-                break
-        if target is None:
-            raise KeyError(job_id)
+    # Verify job exists
+    jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
+    jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
+    found = any(isinstance(j, dict) and str(j.get("id") or "") == job_id for j in jobs)
+    if not found:
+        raise KeyError(job_id)
 
-        payload = target.get("payload")
-        if not isinstance(payload, dict):
-            payload = {}
-            target["payload"] = payload
-        payload["model"] = model_id
-
-        _write_json_atomic(CRON_JOBS_PATH, jobs_payload)
+    openclaw_bin = (
+        os.environ.get("OPENCLAW_BIN")
+        or shutil.which("openclaw")
+        or str(HOME / ".npm-global" / "bin" / "openclaw")
+    )
+    try:
+        proc = subprocess.run(
+            [openclaw_bin, "cron", "edit", job_id, "--model", model_id],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            raise OSError(proc.stderr.strip() or f"openclaw cron edit failed (rc={proc.returncode})")
+    except subprocess.TimeoutExpired:
+        raise OSError("openclaw cron edit timed out")
 
     _invalidate_dashboard_cache()
-    return {"jobId": job_id, "currentModel": model_id, "availableModels": available_models}
+    return {
+        "jobId": job_id,
+        "currentModel": model_id,
+        "availableModels": available_models,
+        "restartTriggered": True,
+        "restartMethod": "openclaw cron edit --model",
+    }
 
 
 def _actual_consumed_tokens(input_tokens: Any, output_tokens: Any, cache_read_tokens: Any) -> int:
@@ -883,12 +956,12 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
         day_map: Dict[str, int] = {k: int(v or 0) for k, v in cached_day_map.items()}
         day_active_map: Dict[str, int] = {
             k: int(v or 0)
-            for k, v in (cached_day_active_map.items() if isinstance(cached_day_active_map, dict) else day_map.items())
-        }
+            for k, v in (cached_day_active_map.items() if isinstance(cached_day_active_map, dict) else [])
+        } or {k: 0 for k in day_map}
         day_passive_map: Dict[str, int] = {
             k: int(v or 0)
-            for k, v in (cached_day_passive_map.items() if isinstance(cached_day_passive_map, dict) else day_map.items())
-        }
+            for k, v in (cached_day_passive_map.items() if isinstance(cached_day_passive_map, dict) else [])
+        } or {k: 0 for k in day_map}
         file_state: Dict[str, Dict[str, int]] = {
             str(k): (v if isinstance(v, dict) else {}) for k, v in cached_file_state.items()
         }
@@ -1802,11 +1875,13 @@ def _collect_cron_data() -> Dict[str, Any]:
     running = 0
     normalized_jobs = []
     enabled_total = 0
+    total_jobs = 0
     agent_ids: List[str] = []
 
     for job in jobs:
         if not isinstance(job, dict):
             continue
+        total_jobs += 1
         enabled = bool(job.get("enabled", False))
         if not enabled:
             continue
@@ -1866,9 +1941,9 @@ def _collect_cron_data() -> Dict[str, Any]:
     distinct_agent_ids = sorted(set(agent_ids))
 
     return {
-        "total": len(normalized_jobs),
-        "enabled": len(normalized_jobs),
-        "disabled": max(0, len(jobs) - enabled_total),
+        "total": total_jobs,
+        "enabled": enabled_total,
+        "disabled": max(0, total_jobs - enabled_total),
         "running": running,
         "hasAgentAssociation": len(distinct_agent_ids) > 1,
         "availableModels": available_models,
@@ -1985,8 +2060,8 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
     if not status_data:
         return {
             "ok": False,
-            "state": "离线",
-            "error": status_err or "无法获取 OpenClaw 状态",
+            "state": "Offline",
+            "error": status_err or "Cannot reach OpenClaw",
             "gateway": {},
             "security": {},
             "update": {},
@@ -2015,15 +2090,15 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
         "deactivating",
     )
 
-    # Never 要求只保留 3 态：正常 / 重启 / 离线
-    if not gateway_reachable:
-        state = "离线"
-    elif any(sig in runtime_lc for sig in restarting_signals):
-        state = "重启"
-    elif service_running:
-        state = "正常"
+    # 3 态：正常 / 重启 / 离线
+    # gateway_reachable 可能因 token 权限不足而误报 false，
+    # 需要结合 gatewayService 的运行状态综合判断。
+    if any(sig in runtime_lc for sig in restarting_signals):
+        state = "Restarting"
+    elif service_running or gateway_reachable:
+        state = "Online"
     else:
-        state = "离线"
+        state = "Offline"
 
     channels = _build_channels_from_status(status_data)
 
@@ -2164,7 +2239,7 @@ def _empty_dashboard_payload() -> Dict[str, Any]:
             "tokens": 0,
             "model": "-",
             "mainTokens": 0,
-            "status": "加载中",
+            "status": "Loading",
         },
         "agents": {"total": 0, "running": 0, "agents": []},
         "subagents": {"total": 0, "running": 0, "runs": []},
@@ -2191,7 +2266,7 @@ def _empty_dashboard_payload() -> Dict[str, Any]:
             "automations": [],
             "impacts": {"selfImprove": {"count": 0, "items": []}, "involve": {"count": 0, "items": []}},
         },
-        "openclaw": {"ok": False, "state": "加载中", "error": "warming up", "gateway": {}, "security": {}, "update": {}, "channels": []},
+        "openclaw": {"ok": False, "state": "Loading", "error": "warming up", "gateway": {}, "security": {}, "update": {}, "channels": []},
         "sessions": {},
         "usage": {},
     }
@@ -2361,6 +2436,17 @@ def create_app() -> Flask:
             return jsonify({"error": f"write failed: {e}"}), 500
         return jsonify(result)
 
+    @app.post("/api/crons/<job_id>/run")
+    def api_cron_run(job_id: str):
+        auth_resp = _require_auth(required_token)
+        if auth_resp is not None:
+            return auth_resp
+        try:
+            result = _trigger_cron_run(job_id)
+        except KeyError:
+            return jsonify({"error": "cron not found", "jobId": job_id}), 404
+        return jsonify(result)
+
     @app.get("/api/cron-monitor/<job_id>")
     def api_cron_monitor(job_id: str):
         auth_resp = _require_auth(required_token)
@@ -2487,7 +2573,7 @@ def create_app() -> Flask:
 
 def _index_html(auth_token: Optional[str] = None) -> str:
     return f"""<!doctype html>
-<html lang="zh-CN" data-bs-theme="dark">
+<html lang="en" data-bs-theme="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -2534,6 +2620,9 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .lang-toggle {{ display:flex; gap:6px; }}
     .lang-btn {{ border:1px solid var(--line); background:var(--card); color:var(--muted); border-radius:999px; padding:6px 10px; font-size:12px; cursor:pointer; }}
     .lang-btn.active {{ color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }}
+    .speed-toggle {{ display:flex; gap:6px; }}
+    .speed-btn {{ border:1px solid var(--line); background:var(--card); color:var(--muted); border-radius:999px; padding:6px 10px; font-size:12px; cursor:pointer; }}
+    .speed-btn.active {{ color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }}
     .nav-tab {{ border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; }}
     .nav-tab.active {{ border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }}
     .page {{ display: none; }}
@@ -2572,6 +2661,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .model-option {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--bg2); }}
     .model-option.active {{ border-color: var(--accent); background: var(--accent-soft); }}
     .memory-layout {{ display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr); gap: 14px; align-items: start; }}
+    .memory-layout > .panel {{ overflow: hidden; }}
+    .memory-layout > .panel table {{ table-layout: fixed; }}
     .memory-meta-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
     .kv-list {{ display: grid; gap: 10px; margin-top: 6px; }}
     .kv-row {{ display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }}
@@ -2639,9 +2730,11 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <button class="nav-tab" data-page="memory" data-i18n="navMemory">Memory</button>
     </div>
     <div class="header-actions">
-      <div class="lang-toggle" aria-label="language toggle">
-        <button class="lang-btn" type="button" data-lang="zh">中文</button>
-        <button class="lang-btn" type="button" data-lang="en">EN</button>
+      <div class="speed-toggle" aria-label="refresh speed">
+        <button class="speed-btn" type="button" data-speed="fastest">Fastest</button>
+        <button class="speed-btn" type="button" data-speed="fast">Fast</button>
+        <button class="speed-btn active" type="button" data-speed="medium">Medium</button>
+        <button class="speed-btn" type="button" data-speed="slow">Slow</button>
       </div>
     </div>
   </header>
@@ -2650,9 +2743,9 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     <section id="page-overview" class="page active">
       <div class="grid compact-grid" id="cards"></div>
       <div class="panel">
-        <h3 style="margin:4px 0 8px">Agent 概览 <span class="pill">含子 Agent</span><span class="pill" id="cd-agents">60秒后刷新</span></h3>
+        <h3 style="margin:4px 0 8px">Agents <span class="pill">incl. Sub-Agents</span><span class="pill" id="cd-agents">refreshing</span></h3>
         <table class="table table-hover align-middle mb-0">
-          <thead><tr><th>Agent</th><th>运行</th><th>Sub-Agent</th><th>Sessions</th><th>Heartbeat</th><th>当前模型</th><th>切换模型</th></tr></thead>
+          <thead><tr><th>Agent</th><th>Status</th><th>Sub-Agent</th><th>Sessions</th><th>Heartbeat</th><th>Current Model</th><th>Switch Model</th></tr></thead>
           <tbody id="agents-body"></tbody>
         </table>
       </div>
@@ -2660,7 +2753,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     <section id="page-flow" class="page">
       <div class="panel">
-        <h3 style="margin:4px 0 8px">全局流转关系（简图）</h3>
+        <h3 style="margin:4px 0 8px">Global Flow Diagram</h3>
         <svg id="flow-svg" viewBox="0 0 1200 240" xmlns="http://www.w3.org/2000/svg">
           <rect x="20" y="70" width="180" height="100" rx="10" fill="#0f172a" stroke="#334155" />
           <text x="42" y="125" fill="#e5e7eb" font-size="20">OpenClaw</text>
@@ -2678,7 +2771,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     <section id="page-crons" class="page">
       <div class="panel">
-        <h3 style="margin:4px 0 8px"><span data-i18n="cronsTitle">Cron 任务</span> <span class="pill" id="cd-crons">60秒后刷新</span></h3>
+        <h3 style="margin:4px 0 8px"><span data-i18n="cronsTitle">Cron Jobs</span> <span class="pill" id="cd-crons">refreshing</span></h3>
         <table class="table table-hover align-middle mb-0">
           <thead id="crons-head"></thead>
           <tbody id="crons-body"></tbody>
@@ -2688,19 +2781,19 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     <section id="page-usage" class="page">
       <div class="panel">
-        <h3 style="margin:4px 0 8px">每日 Token 实际消耗图（最近15天） <span class="pill" id="cd-tokens">60秒后刷新</span></h3>
-        <div id="daily-token-meta" class="meta">加载中…</div>
+        <h3 style="margin:4px 0 8px">Daily Token Consumption (Last 15 Days) <span class="pill" id="cd-tokens">refreshing</span></h3>
+        <div id="daily-token-meta" class="meta">Loading…</div>
         <div class="daily-legend">
-          <span><i class="legend-dot" style="background:#2563eb"></i>主动消耗</span>
-          <span><i class="legend-dot" style="background:#f59f00"></i>被动消耗</span>
+          <span><i class="legend-dot" style="background:#2563eb"></i>Active</span>
+          <span><i class="legend-dot" style="background:#f59f00"></i>Passive</span>
         </div>
-        <div id="daily-token-chart" class="meta">加载中…</div>
+        <div id="daily-token-chart" class="meta">Loading…</div>
       </div>
       <div class="panel">
-        <h3 style="margin:4px 0 8px">模型 Token 实际消耗</h3>
-        <div id="token-consumption-meta" class="meta">加载中…</div>
+        <h3 style="margin:4px 0 8px">Model Token Consumption</h3>
+        <div id="token-consumption-meta" class="meta">Loading…</div>
         <table class="table table-hover align-middle mb-0">
-          <thead><tr><th>Model</th><th>Provider</th><th>Sessions</th><th>总消耗</th><th>主动消耗</th><th>被动消耗</th><th>Input(净/总)</th><th>Output</th><th>Cache(R/W)</th></tr></thead>
+          <thead><tr><th>Model</th><th>Provider</th><th>Sessions</th><th>Total</th><th>Active</th><th>Passive</th><th>Input(net/gross)</th><th>Output</th><th>Cache(R/W)</th></tr></thead>
           <tbody id="models-body"></tbody>
         </table>
       </div>
@@ -2711,37 +2804,37 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <div class="memory-layout">
         <div class="panel">
           <div class="memory-section-title">
-            <h3 style="margin:0" data-i18n="memoryWorkspaceTitle">Memory 工作区概览</h3>
-            <span class="pill" id="cd-memory">60秒后刷新</span>
+            <h3 style="margin:0" data-i18n="memoryWorkspaceTitle">Memory Workspaces</h3>
+            <span class="pill" id="cd-memory">refreshing</span>
           </div>
           <table class="table table-hover align-middle mb-0">
-            <thead><tr><th>Workspace</th><th>条目数</th><th>今日新增</th><th>最新文件</th><th>更新时间</th></tr></thead>
+            <thead><tr><th>Workspace</th><th>Entries</th><th>Today</th><th>Latest File</th><th>Updated</th></tr></thead>
             <tbody id="memory-workspaces-body"></tbody>
           </table>
         </div>
         <div class="memory-meta-grid">
           <div class="panel">
-            <h3 style="margin:4px 0 8px" data-i18n="memoryCapabilitiesTitle">Memory 能力</h3>
-            <div id="memory-capabilities" class="memory-cap-grid">加载中…</div>
+            <h3 style="margin:4px 0 8px" data-i18n="memoryCapabilitiesTitle">Memory Capabilities</h3>
+            <div id="memory-capabilities" class="memory-cap-grid">Loading…</div>
           </div>
           <div class="panel">
-            <h3 style="margin:4px 0 8px" data-i18n="memoryStorageTitle">中央记忆与存储</h3>
-            <div id="memory-storage-summary" class="kv-list">加载中…</div>
+            <h3 style="margin:4px 0 8px" data-i18n="memoryStorageTitle">Central Memory & Storage</h3>
+            <div id="memory-storage-summary" class="kv-list">Loading…</div>
           </div>
           <div class="panel">
-            <h3 style="margin:4px 0 8px" data-i18n="memoryAutomationTitle">Memory 自动化</h3>
-            <div id="memory-automation" class="memory-list">加载中…</div>
+            <h3 style="margin:4px 0 8px" data-i18n="memoryAutomationTitle">Memory Automation</h3>
+            <div id="memory-automation" class="memory-list">Loading…</div>
           </div>
           <div class="panel" style="grid-column: 1 / -1;">
-            <h3 style="margin:4px 0 8px" data-i18n="memoryImpactTitle">self-improve / involve 对 memory 的影响</h3>
-            <div id="memory-impact" class="memory-list">加载中…</div>
+            <h3 style="margin:4px 0 8px" data-i18n="memoryImpactTitle">Memory Impact from self-improve / involve</h3>
+            <div id="memory-impact" class="memory-list">Loading…</div>
           </div>
         </div>
       </div>
       <div class="panel">
-        <h3 style="margin:4px 0 8px" data-i18n="memoryRecentTitle">最近 Memory 文件</h3>
+        <h3 style="margin:4px 0 8px" data-i18n="memoryRecentTitle">Recent Memory Files</h3>
         <table class="table table-hover align-middle mb-0">
-          <thead><tr><th>Workspace</th><th>文件</th><th>大小</th><th>更新时间</th></tr></thead>
+          <thead><tr><th>Workspace</th><th>File</th><th>Size</th><th>Updated</th></tr></thead>
           <tbody id="memory-recent-body"></tbody>
         </table>
       </div>
@@ -2754,8 +2847,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <div class="modal-content" style="background:var(--card);color:var(--text);border:1px solid var(--line);">
         <div class="modal-header" style="border-bottom:1px solid var(--line);">
           <div>
-            <h5 class="modal-title" id="model-switch-title" style="margin:0">切换模型</h5>
-            <div class="model-current" id="model-switch-current">当前模型：-</div>
+            <h5 class="modal-title" id="model-switch-title" style="margin:0">Switch Model</h5>
+            <div class="model-current" id="model-switch-current">Current model: -</div>
           </div>
           <button type="button" class="btn-close" data-modal-close="true" aria-label="Close"></button>
         </div>
@@ -2764,14 +2857,14 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         </div>
         <div class="modal-footer" style="border-top:1px solid var(--line);">
           <span class="model-status me-auto" id="model-switch-status"></span>
-          <button type="button" class="btn btn-secondary" data-modal-close="true" id="model-switch-cancel">取消</button>
-          <button type="button" class="btn btn-primary" id="model-switch-save">保存</button>
+          <button type="button" class="btn btn-secondary" data-modal-close="true" id="model-switch-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="model-switch-save">Save</button>
         </div>
       </div>
     </div>
   </div>
   <script>
-    const SERVER_TOKEN = '{auth_token or ''}';
+    const SERVER_TOKEN = '{(auth_token or "").replace(chr(92), chr(92)*2).replace(chr(39), chr(92)+chr(39))}';
     const $ = (s) => document.querySelector(s);
     const fmtNum = (n) => (n ?? 0).toLocaleString();
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>\"']/g, (ch) => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }})[ch] || ch);
@@ -2796,142 +2889,70 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const rs = Math.round(s % 60);
       return `${{m}}m${{rs}}s`;
     }};
-    const LANG_KEY = 'clawstatus-lang';
     const I18N = {{
-      zh: {{
-        title: '{APP_TITLE}',
-        navOverview: '概览',
-        navFlow: '流转',
-        navCrons: 'Crons',
-        navTokens: 'Tokens',
-        navMemory: 'Memory',
-        cronsTitle: 'Cron 任务',
-        memoryWorkspaceTitle: 'Memory 工作区概览',
-        memoryCapabilitiesTitle: 'Memory 能力',
-        memoryStorageTitle: '中央记忆与存储',
-        memoryAutomationTitle: 'Memory 自动化',
-        memoryImpactTitle: 'self-improve / involve 对 memory 的影响',
-        memoryRecentTitle: '最近 Memory 文件',
-        loading: '加载中…',
-        noData: '暂无数据',
-        noTasks: '暂无任务',
-        autoRefresh: '状态自动刷新',
-        runningNow: '运行中',
-        idle: '未运行',
-        on: '开启',
-        off: '关闭',
-        yes: '是',
-        save: '保存',
-        cancel: '取消',
-        switchModel: '切换模型',
-        currentModel: '当前模型',
-        chooseModel: '请选择模型',
-        saving: '保存中...',
-        saveFailed: '保存失败',
-        noValidModels: '当前没有可切换的有效模型。',
-        schedule: '触发频率',
-        enabled: '启用',
-        running: '运行中',
-        lastStatus: '上次状态',
-        lastDuration: '上次耗时',
-        nextRun: '下次执行',
-        task: '任务',
-        agent: 'Agent',
-        model: '当前模型',
-        switchModelBtn: '切换模型',
-        workspace: 'Workspace',
-        entries: '条目数',
-        todayAdded: '今日新增',
-        latestFile: '最新文件',
-        updatedAt: '更新时间',
-        file: '文件',
-        size: '大小',
-        capabilitySource: '来源',
-        capabilityStatus: '状态',
-        automationEffect: '作用',
-        countdownSuffix: '后刷新',
-        overdue: '立即',
-      }},
-      en: {{
-        title: '{APP_TITLE}',
-        navOverview: 'Overview',
-        navFlow: 'Flow',
-        navCrons: 'Crons',
-        navTokens: 'Tokens',
-        navMemory: 'Memory',
-        cronsTitle: 'Cron Jobs',
-        memoryWorkspaceTitle: 'Memory Workspaces',
-        memoryCapabilitiesTitle: 'Memory Capabilities',
-        memoryStorageTitle: 'Central Memory & Storage',
-        memoryAutomationTitle: 'Memory Automation',
-        memoryImpactTitle: 'Memory Impact from self-improve / involve',
-        memoryRecentTitle: 'Recent Memory Files',
-        loading: 'Loading…',
-        noData: 'No data',
-        noTasks: 'No jobs',
-        autoRefresh: 'Auto-refreshed status',
-        runningNow: 'Running',
-        idle: 'Stopped',
-        on: 'On',
-        off: 'Off',
-        yes: 'Yes',
-        save: 'Save',
-        cancel: 'Cancel',
-        switchModel: 'Switch Model',
-        currentModel: 'Current model',
-        chooseModel: 'Choose a model',
-        saving: 'Saving...',
-        saveFailed: 'Save failed',
-        noValidModels: 'No valid models are available.',
-        schedule: 'Schedule',
-        enabled: 'Enabled',
-        running: 'Running',
-        lastStatus: 'Last Status',
-        lastDuration: 'Last Duration',
-        nextRun: 'Next Run',
-        task: 'Job',
-        agent: 'Agent',
-        model: 'Current Model',
-        switchModelBtn: 'Switch Model',
-        workspace: 'Workspace',
-        entries: 'Entries',
-        todayAdded: 'Today',
-        latestFile: 'Latest File',
-        updatedAt: 'Updated',
-        file: 'File',
-        size: 'Size',
-        capabilitySource: 'Source',
-        capabilityStatus: 'Status',
-        automationEffect: 'Effect',
-        countdownSuffix: 'to refresh',
-        overdue: 'now',
-      }},
+      title: '{APP_TITLE}',
+      navOverview: 'Overview',
+      navFlow: 'Flow',
+      navCrons: 'Crons',
+      navTokens: 'Tokens',
+      navMemory: 'Memory',
+      cronsTitle: 'Cron Jobs',
+      memoryWorkspaceTitle: 'Memory Workspaces',
+      memoryCapabilitiesTitle: 'Memory Capabilities',
+      memoryStorageTitle: 'Central Memory & Storage',
+      memoryAutomationTitle: 'Memory Automation',
+      memoryImpactTitle: 'Memory Impact from self-improve / involve',
+      memoryRecentTitle: 'Recent Memory Files',
+      loading: 'Loading…',
+      noData: 'No data',
+      noTasks: 'No jobs',
+      autoRefresh: 'Auto-refreshed status',
+      runningNow: 'Running',
+      idle: 'Stopped',
+      on: 'On',
+      off: 'Off',
+      yes: 'Yes',
+      save: 'Save',
+      cancel: 'Cancel',
+      switchModel: 'Switch Model',
+      currentModel: 'Current model',
+      chooseModel: 'Choose a model',
+      saving: 'Saving...',
+      saveFailed: 'Save failed',
+      restarting: 'Restarting OpenClaw…',
+      restartFailed: 'Model saved, but OpenClaw restart failed',
+      noValidModels: 'No valid models are available.',
+      schedule: 'Schedule',
+      enabled: 'Enabled',
+      running: 'Running',
+      lastStatus: 'Last Status',
+      lastDuration: 'Last Duration',
+      nextRun: 'Next Run',
+      task: 'Job',
+      agent: 'Agent',
+      model: 'Current Model',
+      switchModelBtn: 'Switch Model',
+      triggerRun: 'Run',
+      triggering: 'Running...',
+      triggered: 'Triggered',
+      triggerFailed: 'Trigger failed',
+      workspace: 'Workspace',
+      entries: 'Entries',
+      todayAdded: 'Today',
+      latestFile: 'Latest File',
+      updatedAt: 'Updated',
+      file: 'File',
+      size: 'Size',
+      capabilitySource: 'Source',
+      capabilityStatus: 'Status',
+      automationEffect: 'Effect',
+      countdownSuffix: 'to refresh',
+      overdue: 'now',
     }};
-    let currentLang = localStorage.getItem(LANG_KEY) || 'zh';
-    if (!I18N[currentLang]) currentLang = 'zh';
+    const currentLang = 'en';
 
     function t(key) {{
-      return (I18N[currentLang] && I18N[currentLang][key]) || (I18N.zh && I18N.zh[key]) || key;
-    }}
-
-    function setLang(lang) {{
-      currentLang = I18N[lang] ? lang : 'zh';
-      localStorage.setItem(LANG_KEY, currentLang);
-      document.documentElement.lang = currentLang === 'en' ? 'en' : 'zh-CN';
-      document.title = t('title');
-      document.querySelectorAll('[data-i18n]').forEach((el) => {{
-        const key = el.getAttribute('data-i18n');
-        if (key) el.textContent = t(key);
-      }});
-      document.querySelectorAll('.lang-btn').forEach((btn) => {{
-        btn.classList.toggle('active', btn.getAttribute('data-lang') === currentLang);
-      }});
-      const cancelBtn = $('#model-switch-cancel');
-      const saveBtn = $('#model-switch-save');
-      if (cancelBtn) cancelBtn.textContent = t('cancel');
-      if (saveBtn) saveBtn.textContent = t('save');
-      paintCountdown();
-      render(dashboardState);
+      return I18N[key] || key;
     }}
 
     function fmtRelative(ms) {{
@@ -2974,8 +2995,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     function stateBadge(v) {{
       const s = String(v ?? '').toLowerCase();
-      if (v === true || s === 'true' || s === 'running' || s === 'healthy' || s === '正常') return '<span class="ok">●</span>';
-      if (s === '重启' || s.includes('restart') || s.includes('starting') || s.includes('activating')) return '<span class="warn">●</span>';
+      if (v === true || s === 'true' || s === 'running' || s === 'healthy' || s === 'online') return '<span class="ok">●</span>';
+      if (s === 'restarting' || s.includes('restart') || s.includes('starting') || s.includes('activating')) return '<span class="warn">●</span>';
       return '<span class="bad">●</span>';
     }}
 
@@ -3024,6 +3045,33 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       models: {{ url: '/api/models', interval: 120, remain: 6, page: 'usage' }},
       memory: {{ url: '/api/memory', interval: 120, remain: 8, page: 'memory' }},
     }};
+
+    const SPEED_KEY = 'clawstatus-speed';
+    const SPEED_BASE = {{
+      overview: 15, openclaw: 30, agents: 30, crons: 60, models: 120, memory: 120,
+    }};
+    const SPEED_MULT = {{ fastest: 0.25, fast: 0.5, medium: 1, slow: 2 }};
+    let currentSpeed = localStorage.getItem(SPEED_KEY) || 'medium';
+    if (!SPEED_MULT[currentSpeed]) currentSpeed = 'medium';
+
+    function applySpeed(speed) {{
+      currentSpeed = SPEED_MULT[speed] ? speed : 'medium';
+      localStorage.setItem(SPEED_KEY, currentSpeed);
+      const mult = SPEED_MULT[currentSpeed];
+      Object.keys(SPEED_BASE).forEach(key => {{
+        if (refreshState[key]) {{
+          refreshState[key].interval = Math.max(3, Math.round(SPEED_BASE[key] * mult));
+        }}
+      }});
+      document.querySelectorAll('.speed-btn').forEach(btn => {{
+        btn.classList.toggle('active', btn.getAttribute('data-speed') === currentSpeed);
+      }});
+    }}
+
+    document.querySelectorAll('.speed-btn').forEach(btn => {{
+      btn.addEventListener('click', () => applySpeed(btn.getAttribute('data-speed')));
+    }});
+    applySpeed(currentSpeed);
 
     const refreshingKeys = new Set();
     let selectedCronId = null;
@@ -3168,8 +3216,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
       const ov = d.overview || {{}};
       const o = d.openclaw || {{}};
+      const ocState = String(o.state || '').toLowerCase();
+      const ocColor = (ocState === 'online') ? 'ok' : (ocState === 'restarting' ? 'warn' : 'bad');
       const cards = [
-        ['OpenClaw', o.state || '-', t('autoRefresh')],
+        ['OpenClaw', `<span class="${{ocColor}}">${{o.state || '-'}}</span>`, t('autoRefresh')],
         ['Agents', ov.agentCount, `${{t('runningNow')}} ${{fmtNum(ov.runningAgents)}}`],
         ['Sub-Agents', ov.subagentCount, `${{t('runningNow')}} ${{fmtNum(ov.runningSubagents)}}`],
         ['Crons', ov.cronCount, `${{t('runningNow')}} ${{fmtNum(ov.runningCrons)}}`],
@@ -3178,7 +3228,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       $('#cards').innerHTML = cards.map(([k,v,s]) => `
         <div class="card">
           <div class="k">${{k}}</div>
-          <div class="v ${{typeof v === 'string' ? 'sm' : ''}}">${{typeof v === 'number' ? fmtNum(v) : v}}</div>
+          <div class="v ${{typeof v === 'number' ? '' : 'sm'}}">${{typeof v === 'number' ? fmtNum(v) : v}}</div>
           <div class="meta">${{s}}</div>
         </div>
       `).join('');
@@ -3207,7 +3257,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const models = (modelsData.models || []).filter(m => Number(m.tokens || 0) > 0);
       const metaEl = $('#token-consumption-meta');
       if (metaEl) {{
-        metaEl.textContent = `${{modelsData.formula || '实际消耗 Token = 净输入 + 输出；净输入 = max(0, 输入 - 缓存复用)'}}｜${{t('runningNow')}} ${{fmtNum(modelsData.activeTokens || 0)}}（${{fmtNum(modelsData.activeSessions || 0)}} sessions）｜Passive ${{fmtNum(modelsData.passiveTokens || 0)}}（${{fmtNum(modelsData.passiveSessions || 0)}} sessions）`;
+        metaEl.textContent = `${{modelsData.formula || 'Actual tokens = net input + output; net input = max(0, input - cache reuse)'}} | ${{t('runningNow')}} ${{fmtNum(modelsData.activeTokens || 0)}} (${{fmtNum(modelsData.activeSessions || 0)}} sessions) | Passive ${{fmtNum(modelsData.passiveTokens || 0)}} (${{fmtNum(modelsData.passiveSessions || 0)}} sessions)`;
       }}
 
       $('#models-body').innerHTML = models.map(m => `
@@ -3246,12 +3296,13 @@ def _index_html(auth_token: Optional[str] = None) -> str:
             <th>${{t('lastDuration')}}</th>
             <th>${{t('nextRun')}}</th>
             <th>${{t('switchModelBtn')}}</th>
+            <th>${{t('triggerRun')}}</th>
           </tr>
         `;
       }}
 
       const cronsBody = $('#crons-body');
-      const colspan = 8;
+      const colspan = 9;
       cronsBody.innerHTML = crons.map(c => `
         <tr>
           <td>${{escapeHtml(c.name || c.id || '-')}}</td>
@@ -3262,9 +3313,43 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{c.lastDurationMs ? Math.round(c.lastDurationMs/1000)+'s' : '-'}}</td>
           <td class="next-run" data-next-run-ms="${{c.nextRunAtMs || ''}}">${{fmtRelative(c.nextRunAtMs)}}</td>
           <td class="model-cell">${{renderModelSwitchButton('cron', c.id, c.currentModel, cronModels)}}</td>
+          <td><button class="btn-monitor btn-cron-run" data-cron-id="${{escapeHtml(c.id)}}">${{t('triggerRun')}}</button></td>
         </tr>
       `).join('') || `<tr><td colspan="${{colspan}}" class="meta">${{t('noTasks')}}</td></tr>`;
       bindModelSwitchButtons('cron');
+      bindCronRunButtons();
+    }}
+
+    function bindCronRunButtons() {{
+      document.querySelectorAll('.btn-cron-run').forEach(btn => {{
+        btn.addEventListener('click', async () => {{
+          const jobId = btn.getAttribute('data-cron-id');
+          btn.disabled = true;
+          btn.textContent = t('triggering');
+          btn.style.color = 'var(--warn)';
+          const hdrs = {{}};
+          if (token()) hdrs['Authorization'] = 'Bearer ' + token();
+          try {{
+            const result = await postJson(`/api/crons/${{encodeURIComponent(jobId)}}/run`, {{}}, hdrs);
+            if (result && result.triggered) {{
+              btn.textContent = '✓ ' + t('triggered');
+              btn.style.color = 'var(--ok)';
+              setTimeout(() => refreshOne('crons', true), 3000);
+            }} else {{
+              btn.textContent = t('triggerFailed');
+              btn.style.color = 'var(--bad)';
+            }}
+          }} catch (e) {{
+            btn.textContent = t('triggerFailed');
+            btn.style.color = 'var(--bad)';
+          }}
+          setTimeout(() => {{
+            btn.disabled = false;
+            btn.textContent = t('triggerRun');
+            btn.style.color = '';
+          }}, 5000);
+        }});
+      }});
     }}
 
     function renderCronMonitorList(crons) {{
@@ -3273,17 +3358,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const detailEl = $('#cron-monitor-detail');
       if (!listEl) return;
       if (!crons || !crons.length) {{
-        listEl.innerHTML = '<div class="meta">暂无任务</div>';
-        if (detailTitle) detailTitle.textContent = '执行内容';
-        if (detailEl) detailEl.textContent = '当前没有可监督的任务。';
+        listEl.innerHTML = '<div class="meta">No jobs</div>';
+        if (detailTitle) detailTitle.textContent = 'Run Details';
+        if (detailEl) detailEl.textContent = 'No jobs to monitor.';
         return;
       }}
       listEl.innerHTML = (crons || []).map(c => `
         <button class="monitor-list-item ${{selectedCronId === c.id ? 'active' : ''}}" data-cron-id="${{c.id}}">
           <div><strong>${{c.name}}</strong></div>
-          <div class="meta">${{c.scheduleText || '-'}} · ${{c.running ? '运行中' : (c.enabled ? '等待中' : '未启用')}}</div>
+          <div class="meta">${{c.scheduleText || '-'}} · ${{c.running ? 'Running' : (c.enabled ? 'Waiting' : 'Disabled')}}</div>
         </button>
-      `).join('') || '<div class="meta">暂无任务</div>';
+      `).join('') || '<div class="meta">No jobs</div>';
 
       listEl.querySelectorAll('.monitor-list-item').forEach(btn => {{
         btn.addEventListener('click', () => showCronMonitor(btn.getAttribute('data-cron-id')));
@@ -3298,23 +3383,23 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       selectedCronId = id;
       renderCronMonitorList(Array.from(cronMap.values()));
 
-      if (detailTitle) detailTitle.textContent = `执行内容 · ${{c.name}}（${{c.scheduleText || '-'}}）`;
+      if (detailTitle) detailTitle.textContent = `Run Details · ${{c.name}} (${{c.scheduleText || '-'}})`;
 
       if (cronMonitorCache.has(id)) {{
         detailEl.textContent = cronMonitorCache.get(id);
         return;
       }}
 
-      detailEl.textContent = '加载监控内容中...';
+      detailEl.textContent = 'Loading monitor data...';
       try {{
         const headers = {{}};
         if (token()) headers['Authorization'] = 'Bearer ' + token();
         const data = await fetchJson(`/api/cron-monitor/${{encodeURIComponent(id)}}`, headers);
-        const txt = (data && data.monitorText) ? data.monitorText : '该任务未提供具体工作内容。';
+        const txt = (data && data.monitorText) ? data.monitorText : 'No monitor content available for this job.';
         cronMonitorCache.set(id, txt);
         if (selectedCronId === id) detailEl.textContent = txt;
       }} catch (e) {{
-        detailEl.textContent = '监控内容加载失败，请稍后重试。';
+        detailEl.textContent = 'Failed to load monitor data. Please try again.';
       }}
     }}
 
@@ -3440,13 +3525,20 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           const url = modelModalState.kind === 'agent'
             ? `/api/agents/${{encodeURIComponent(modelModalState.entityId)}}/model`
             : `/api/crons/${{encodeURIComponent(modelModalState.entityId)}}/model`;
-          await postJson(url, {{ model }}, headers);
-          modalController.hide();
+          const result = await postJson(url, {{ model }}, headers);
+          if (result && result.restartTriggered) {{
+            statusEl.textContent = '✓ ' + t('restarting');
+            statusEl.style.color = 'var(--ok)';
+          }} else {{
+            statusEl.textContent = t('restartFailed');
+            statusEl.style.color = 'var(--warn)';
+          }}
           if (modelModalState.kind === 'agent') {{
             refreshOne('agents', true);
           }} else {{
             refreshOne('crons', true);
           }}
+          setTimeout(() => {{ modalController.hide(); statusEl.style.color = ''; }}, 3000);
         }} catch (e) {{
           statusEl.textContent = `${{t('saveFailed')}}: ` + (e.message || e);
           console.warn('model switch failed', e);
@@ -3471,10 +3563,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const capabilities = m.capabilities || [];
 
       const cards = [
-        [currentLang === 'en' ? 'Workspaces' : '工作区', s.workspaceCount || 0, `${{currentLang === 'en' ? 'Entries' : '总条目'}} ${{fmtNum(s.totalEntries || 0)}}`],
-        [currentLang === 'en' ? 'Today' : '今日新增', s.todayEntries || 0, `${{currentLang === 'en' ? 'Recent files' : '最近文件'}} ${{fmtNum(s.recentCount || 0)}}`],
-        [currentLang === 'en' ? 'Central topics' : '中央记忆主题', c.topicsCount || 0, `memories-md ${{fmtNum(c.memoriesMdCount || 0)}}`],
-        [currentLang === 'en' ? 'Capabilities' : '能力数', capabilities.length || 0, `${{currentLang === 'en' ? 'SQLite' : 'SQLite'}} ${{fmtBytes(st.sqliteBytes || 0)}}`],
+        ['Workspaces', s.workspaceCount || 0, `Entries ${{fmtNum(s.totalEntries || 0)}}`],
+        ['Today', s.todayEntries || 0, `Recent files ${{fmtNum(s.recentCount || 0)}}`],
+        ['Central topics', c.topicsCount || 0, `memories-md ${{fmtNum(c.memoriesMdCount || 0)}}`],
+        ['Capabilities', capabilities.length || 0, `SQLite ${{fmtBytes(st.sqliteBytes || 0)}}`],
       ];
       const cardsEl = $('#memory-cards');
       if (cardsEl) {{
@@ -3532,9 +3624,9 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         const rows = [
           ['central topics', fmtNum(central.topicsCount || 0)],
           ['memories-md', fmtNum(central.memoriesMdCount || 0)],
-          [currentLang === 'en' ? 'Latest topic' : '最新 topic 更新时间', fmtTime(central.latestTopicAt)],
-          ['MEMORY.md', central.hasMemoryMd ? (currentLang === 'en' ? 'Found' : '已存在') : (currentLang === 'en' ? 'Missing' : '未发现')],
-          [currentLang === 'en' ? 'SQLite files' : 'SQLite 文件', `${{fmtNum(storage.sqliteCount || 0)}} · ${{fmtBytes(storage.sqliteBytes || 0)}}`],
+          ['Latest topic', fmtTime(central.latestTopicAt)],
+          ['MEMORY.md', central.hasMemoryMd ? 'Found' : 'Missing'],
+          ['SQLite files', `${{fmtNum(storage.sqliteCount || 0)}} · ${{fmtBytes(storage.sqliteBytes || 0)}}`],
           ['LanceDB', fmtBytes(storage.lancedbBytes || 0)],
           ['backups', fmtNum(storage.backupCount || 0)],
         ];
@@ -3578,7 +3670,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           return `
             <div class="memory-list-item">
               <strong>${{escapeHtml(title)}}</strong>
-              <div class="meta">${{currentLang === 'en' ? 'Related jobs' : '影响任务数'}}：${{fmtNum(group.count || 0)}}</div>
+              <div class="meta">Related jobs: ${{fmtNum(group.count || 0)}}</div>
               ${{items.length ? items.map((it) => `
                 <div class="kv-row">
                   <div>
@@ -3645,7 +3737,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         }}
 
         const label = String(r.date || '').slice(5);
-        const title = `${{r.date}}: 总 ${{fmtNum(total)}}（主动 ${{fmtNum(active)}} / 被动 ${{fmtNum(passive)}}）`;
+        const title = `${{r.date}}: Total ${{fmtNum(total)}} (Active ${{fmtNum(active)}} / Passive ${{fmtNum(passive)}})`;
         const passiveCls = passive > 0 ? 'daily-bar-passive has-value' : 'daily-bar-passive';
         return `
           <div class="daily-item" title="${{title}}">
@@ -3663,7 +3755,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
       const today = recentRows[recentRows.length - 1] || {{}};
       if (metaEl) {{
-        metaEl.textContent = `最近15天｜今日总消耗: ${{fmtM(today.tokens || 0)}}（主动 ${{fmtNum(today.activeTokens || 0)}} / 被动 ${{fmtNum(today.passiveTokens || 0)}}）`;
+        metaEl.textContent = `Last 15 days | Today: ${{fmtM(today.tokens || 0)}} (Active ${{fmtNum(today.activeTokens || 0)}} / Passive ${{fmtNum(today.passiveTokens || 0)}})`;
       }}
 
       el.className = 'daily-chart';
@@ -3682,10 +3774,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       setActivePage(page, {{ forceRefresh: true, replaceUrl: true }});
     }});
 
-    document.querySelectorAll('.lang-btn').forEach((btn) => {{
-      btn.addEventListener('click', () => setLang(btn.getAttribute('data-lang') || 'zh'));
-    }});
-
     function paintRelativeTimes() {{
       document.querySelectorAll('[data-next-run-ms]').forEach((el) => {{
         const raw = el.getAttribute('data-next-run-ms');
@@ -3702,11 +3790,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       }};
       Object.entries(map).forEach(([sel, sec]) => {{
         const el = $(sel);
-        if (el) el.textContent = currentLang === 'en' ? `${{sec}}s ${{t('countdownSuffix')}}` : `${{sec}}秒${{t('countdownSuffix')}}`;
+        if (el) el.textContent = `${{sec}}s ${{t('countdownSuffix')}}`;
       }});
     }}
 
-    setLang(currentLang);
     paintCountdown();
     bootstrapRefresh();
     bindModelSwitchModal();
