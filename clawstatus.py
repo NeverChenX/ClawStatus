@@ -2730,6 +2730,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <button class="nav-tab" data-page="memory" data-i18n="navMemory">Memory</button>
     </div>
     <div class="header-actions">
+      <div class="lang-toggle" aria-label="language">
+        <button class="lang-btn active" type="button" data-lang="en">EN</button>
+        <button class="lang-btn" type="button" data-lang="zh">中</button>
+      </div>
       <div class="speed-toggle" aria-label="refresh speed">
         <button class="speed-btn" type="button" data-speed="fastest">Fastest</button>
         <button class="speed-btn" type="button" data-speed="fast">Fast</button>
@@ -2949,10 +2953,84 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       countdownSuffix: 'to refresh',
       overdue: 'now',
     }};
-    const currentLang = 'en';
+    const I18N_ZH = {{
+      title: '{APP_TITLE}',
+      navOverview: '概览',
+      navFlow: '流程',
+      navCrons: '定时任务',
+      navTokens: 'Token',
+      navMemory: '记忆',
+      cronsTitle: '定时任务',
+      memoryWorkspaceTitle: '工作区记忆',
+      memoryCapabilitiesTitle: '记忆能力',
+      memoryStorageTitle: '中央记忆与存储',
+      memoryAutomationTitle: '记忆自动化',
+      memoryImpactTitle: '自我升级 / 介入 对记忆的影响',
+      memoryRecentTitle: '近期记忆文件',
+      loading: '加载中…',
+      noData: '暂无数据',
+      noTasks: '暂无任务',
+      autoRefresh: '已自动刷新',
+      runningNow: '运行中',
+      idle: '空闲',
+      on: '开',
+      off: '关',
+      yes: '是',
+      save: '保存',
+      cancel: '取消',
+      switchModel: '切换模型',
+      currentModel: '当前模型',
+      chooseModel: '选择模型',
+      saving: '保存中…',
+      saveFailed: '保存失败',
+      restarting: '正在重启 OpenClaw…',
+      restartFailed: '模型已保存，但 OpenClaw 重启失败',
+      noValidModels: '当前没有可切换的有效模型。',
+      schedule: '频率',
+      enabled: '已启用',
+      running: '运行中',
+      lastStatus: '上次状态',
+      lastDuration: '上次耗时',
+      nextRun: '下次执行',
+      task: '任务',
+      agent: 'Agent',
+      model: '当前模型',
+      switchModelBtn: '切换模型',
+      triggerRun: '立即运行',
+      triggering: '运行中…',
+      triggered: '已触发',
+      triggerFailed: '触发失败',
+      workspace: '工作区',
+      entries: '条目数',
+      todayAdded: '今日新增',
+      latestFile: '最新文件',
+      updatedAt: '更新时间',
+      file: '文件',
+      size: '大小',
+      capabilitySource: '来源',
+      capabilityStatus: '状态',
+      automationEffect: '效果',
+      countdownSuffix: '后刷新',
+      overdue: '立即',
+    }};
+    const LANG_KEY = 'clawstatus-lang';
+    let currentLang = localStorage.getItem(LANG_KEY) || 'en';
 
     function t(key) {{
-      return I18N[key] || key;
+      const table = currentLang === 'zh' ? I18N_ZH : I18N;
+      return (table && table[key]) || I18N[key] || key;
+    }}
+
+    function applyLang(lang) {{
+      currentLang = (lang === 'zh') ? 'zh' : 'en';
+      localStorage.setItem(LANG_KEY, currentLang);
+      document.querySelectorAll('.lang-btn').forEach(b => {{
+        b.classList.toggle('active', b.getAttribute('data-lang') === currentLang);
+      }});
+      document.querySelectorAll('[data-i18n]').forEach(el => {{
+        const k = el.getAttribute('data-i18n');
+        if (k) el.textContent = t(k);
+      }});
     }}
 
     function fmtRelative(ms) {{
@@ -3072,6 +3150,11 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       btn.addEventListener('click', () => applySpeed(btn.getAttribute('data-speed')));
     }});
     applySpeed(currentSpeed);
+
+    document.querySelectorAll('.lang-btn').forEach(btn => {{
+      btn.addEventListener('click', () => applyLang(btn.getAttribute('data-lang')));
+    }});
+    applyLang(currentLang);
 
     const refreshingKeys = new Set();
     let selectedCronId = null;
@@ -3283,6 +3366,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const cronModels = (data || {{}}).availableModels || [];
       cronMap.clear();
       crons.forEach(c => cronMap.set(c.id, c));
+      // hide disabled cron jobs
+      const visibleCrons = crons.filter(c => c.enabled !== false);
 
       const head = $('#crons-head');
       if (head) {{
@@ -3303,7 +3388,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
       const cronsBody = $('#crons-body');
       const colspan = 9;
-      cronsBody.innerHTML = crons.map(c => `
+      cronsBody.innerHTML = visibleCrons.map(c => `
         <tr>
           <td>${{escapeHtml(c.name || c.id || '-')}}</td>
           <td>${{escapeHtml(c.scheduleText || '-')}}</td>
