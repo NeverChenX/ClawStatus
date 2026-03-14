@@ -3229,8 +3229,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     }}
 
     function renderCronTable(data) {{
-      const crons = (data || {}).jobs || [];
-      const cronModels = (data || {}).availableModels || [];
+      const crons = (data || {{}}).jobs || [];
+      const cronModels = (data || {{}}).availableModels || [];
       cronMap.clear();
       crons.forEach(c => cronMap.set(c.id, c));
 
