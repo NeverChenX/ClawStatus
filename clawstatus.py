@@ -32,7 +32,7 @@ try:
 except Exception:  # pragma: no cover
     waitress_serve = None
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 APP_TITLE = "ClawStatus"
 
 HOME = Path.home()
@@ -2339,10 +2339,24 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .monitor-content {{ white-space: pre-wrap; font-size:12px; line-height:1.5; max-height:300px; overflow:auto; color: var(--text); }}
     .btn-monitor {{ border:1px solid var(--line); background:var(--bg2); color:var(--text); border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; }}
     .btn-monitor:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
-    .model-cell {{ min-width: 260px; }}
-    .model-switcher {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-    .model-select {{ min-width: 190px; max-width: 100%; border:1px solid var(--line); background:var(--bg2); color:var(--text); border-radius:8px; padding:6px 10px; font-size:12px; }}
+    .model-cell {{ min-width: 110px; }}
     .model-status {{ color: var(--muted); font-size: 12px; }}
+    .model-current {{ color: var(--muted); font-size: 12px; margin-bottom: 10px; }}
+    .model-options {{ display: grid; gap: 8px; }}
+    .model-option {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--bg2); }}
+    .model-option.active {{ border-color: var(--accent); background: var(--accent-soft); }}
+    .memory-layout {{ display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr); gap: 14px; align-items: start; }}
+    .memory-meta-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
+    .kv-list {{ display: grid; gap: 10px; margin-top: 6px; }}
+    .kv-row {{ display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }}
+    .kv-row:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .kv-key {{ color: var(--muted); font-size: 12px; }}
+    .kv-value {{ text-align: right; font-size: 13px; }}
+    .memory-section-title {{ margin: 4px 0 8px; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }}
+    .memory-list {{ display: grid; gap: 8px; }}
+    .memory-list-item {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--bg2); }}
+    .memory-list-item strong {{ display: block; margin-bottom: 4px; }}
+    .memory-list-item .meta {{ margin-top: 4px; }}
     .daily-chart {{ display:flex; align-items:flex-end; justify-content:space-between; gap:10px; min-height:240px; padding: 10px 6px 0; overflow: hidden; }}
     .daily-item {{ flex: 1 1 0; min-width: 44px; max-width: 72px; text-align:center; }}
     .daily-bar-wrap {{ height: 160px; display:flex; align-items:flex-end; justify-content:center; }}
@@ -2358,7 +2372,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     #flow-svg {{ width: 100%; height: 240px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }}
     #boot-overlay {{ display: none; }}
     @media (max-width: 1200px) {{ header {{ grid-template-columns: 1fr; }} h1 {{ justify-self: center; }} .nav {{ justify-content: center; }} }}
-    @media (max-width: 1000px) {{ .grid {{ grid-template-columns: repeat(2,minmax(160px,1fr)); }} .monitor-grid {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 1000px) {{ .grid {{ grid-template-columns: repeat(2,minmax(160px,1fr)); }} .monitor-grid {{ grid-template-columns: 1fr; }} .memory-layout {{ grid-template-columns: 1fr; }} .memory-meta-grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
@@ -2435,20 +2449,31 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     <section id="page-memory" class="page">
       <div class="grid" id="memory-cards"></div>
-      <div class="panel">
-        <h3 style="margin:4px 0 8px">memory-pro 插件说明</h3>
-        <div id="memory-plugin-desc" class="monitor-content">加载中…</div>
-      </div>
-      <div class="panel">
-        <h3 style="margin:4px 0 8px">self-improve / involve 对 memory 的影响</h3>
-        <div id="memory-impact" class="monitor-content">加载中…</div>
-      </div>
-      <div class="panel">
-        <h3 style="margin:4px 0 8px">Memory 工作区概览 <span class="pill" id="cd-memory">60秒后刷新</span></h3>
-        <table class="table table-hover align-middle mb-0">
-          <thead><tr><th>Workspace</th><th>条目数</th><th>今日新增</th><th>最新文件</th><th>更新时间</th></tr></thead>
-          <tbody id="memory-workspaces-body"></tbody>
-        </table>
+      <div class="memory-layout">
+        <div class="panel">
+          <div class="memory-section-title">
+            <h3 style="margin:0">Memory 工作区概览</h3>
+            <span class="pill" id="cd-memory">60秒后刷新</span>
+          </div>
+          <table class="table table-hover align-middle mb-0">
+            <thead><tr><th>Workspace</th><th>条目数</th><th>今日新增</th><th>最新文件</th><th>更新时间</th></tr></thead>
+            <tbody id="memory-workspaces-body"></tbody>
+          </table>
+        </div>
+        <div class="memory-meta-grid">
+          <div class="panel">
+            <h3 style="margin:4px 0 8px">中央记忆与存储</h3>
+            <div id="memory-storage-summary" class="kv-list">加载中…</div>
+          </div>
+          <div class="panel">
+            <h3 style="margin:4px 0 8px">memory-pro 插件</h3>
+            <div id="memory-plugin-desc" class="memory-list">加载中…</div>
+          </div>
+          <div class="panel" style="grid-column: 1 / -1;">
+            <h3 style="margin:4px 0 8px">self-improve / involve 对 memory 的影响</h3>
+            <div id="memory-impact" class="memory-list">加载中…</div>
+          </div>
+        </div>
       </div>
       <div class="panel">
         <h3 style="margin:4px 0 8px">最近 Memory 文件</h3>
@@ -2458,6 +2483,28 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         </table>
       </div>
     </section>
+  </div>
+
+  <div class="modal fade" id="model-switch-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-scrollable">
+      <div class="modal-content" style="background:var(--card);color:var(--text);border:1px solid var(--line);">
+        <div class="modal-header" style="border-bottom:1px solid var(--line);">
+          <div>
+            <h5 class="modal-title" id="model-switch-title" style="margin:0">切换模型</h5>
+            <div class="model-current" id="model-switch-current">当前模型：-</div>
+          </div>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" style="filter:invert(1);"></button>
+        </div>
+        <div class="modal-body">
+          <div id="model-switch-options" class="model-options"></div>
+        </div>
+        <div class="modal-footer" style="border-top:1px solid var(--line);">
+          <span class="model-status me-auto" id="model-switch-status"></span>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" style="background:var(--bg2);border:1px solid var(--line);color:var(--text);">取消</button>
+          <button type="button" class="btn btn-primary" id="model-switch-save" style="background:var(--accent);border:none;color:#fff;">保存</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
@@ -2545,6 +2592,12 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     let selectedCronId = null;
     const cronMap = new Map();
     const cronMonitorCache = new Map();
+    const modelModalState = {{
+      kind: '',
+      entityId: '',
+      currentModel: '',
+      models: [],
+    }};
 
     function saveSnapshot() {{
       try {{
@@ -2703,10 +2756,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{fmtNum(a.sessionsCount)}}</td>
           <td>${{a.heartbeatEnabled ? 'on (' + (a.heartbeatEvery || '-') + ')' : 'off'}}</td>
           <td>${{escapeHtml(a.currentModel || '-')}}</td>
-          <td class="model-cell">${{renderModelSwitcher('agent', a.id, a.currentModel, agentModels)}}</td>
+          <td class="model-cell">${{renderModelSwitchButton('agent', a.id, a.currentModel, agentModels)}}</td>
         </tr>
       `).join('') || '<tr><td colspan="7" class="meta">暂无数据</td></tr>';
-      bindModelSwitchers('agent');
+      bindModelSwitchButtons('agent');
 
 
       const crons = (d.crons || {{}}).jobs || [];
@@ -2726,10 +2779,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{c.lastStatus || '-'}}</td>
           <td>${{c.lastDurationMs ? Math.round(c.lastDurationMs/1000)+'s' : '-'}}</td>
           <td>${{fmtTime(c.nextRunAtMs)}}</td>
-          <td class="model-cell">${{renderModelSwitcher('cron', c.id, c.currentModel, cronModels)}}</td>
+          <td class="model-cell">${{renderModelSwitchButton('cron', c.id, c.currentModel, cronModels)}}</td>
         </tr>
       `).join('') || '<tr><td colspan="10" class="meta">暂无数据</td></tr>';
-      bindModelSwitchers('cron');
+      bindModelSwitchButtons('cron');
 
       const daily = (d.models || {{}}).dailyTokens || [];
       renderDailyChart(daily);
@@ -2809,70 +2862,141 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       }}
     }}
 
-    function renderModelSwitcher(kind, entityId, currentModel, models) {{
-      const items = Array.isArray(models) ? models : [];
-      const current = String(currentModel || '');
-      const seen = new Set();
-      const opts = [];
+    function modelOptionLabel(row) {{
+      const id = String((row && row.id) || '').trim();
+      const label = String((row && row.name) || id).trim() || id;
+      const provider = String((row && row.provider) || '').trim();
+      if (provider) return `${{label}} · ${{provider}}`;
+      return label || id;
+    }}
 
-      items.forEach((row) => {{
+    function renderModelSwitchButton(kind, entityId, currentModel, models) {{
+      const encodedModels = encodeURIComponent(JSON.stringify(Array.isArray(models) ? models : []));
+      return `<button class="btn-monitor btn-model-switch" data-kind="${{escapeHtml(kind)}}" data-id="${{escapeHtml(entityId)}}" data-current-model="${{escapeHtml(currentModel || '')}}" data-models="${{encodedModels}}">切换模型</button>`;
+    }}
+
+    function openModelSwitchModal(kind, entityId, currentModel, models) {{
+      const titleEl = $('#model-switch-title');
+      const currentEl = $('#model-switch-current');
+      const optionsEl = $('#model-switch-options');
+      const statusEl = $('#model-switch-status');
+      const validModels = [];
+      const seen = new Set();
+
+      (Array.isArray(models) ? models : []).forEach((row) => {{
         const id = String((row && row.id) || '').trim();
         if (!id || seen.has(id)) return;
         seen.add(id);
-        const label = String((row && row.name) || id).trim() || id;
-        const provider = String((row && row.provider) || '').trim();
-        const text = provider && label !== id ? `${{label}} [${{id}}]` : (label || id);
-        opts.push(`<option value="${{escapeHtml(id)}}" ${{id === current ? 'selected' : ''}}>${{escapeHtml(text)}}</option>`);
+        validModels.push(row);
       }});
 
-      if (current && !seen.has(current)) {{
-        opts.unshift(`<option value="${{escapeHtml(current)}}" selected>${{escapeHtml(current)}} (current)</option>`);
+      modelModalState.kind = kind;
+      modelModalState.entityId = entityId;
+      modelModalState.currentModel = String(currentModel || '').trim();
+      modelModalState.models = validModels;
+
+      if (titleEl) titleEl.textContent = `切换模型 · ${{kind === 'agent' ? 'Agent' : 'Cron'}}`;
+      if (currentEl) currentEl.textContent = `当前模型：${{modelModalState.currentModel || '-'}}`;
+      if (statusEl) statusEl.textContent = '';
+
+      if (optionsEl) {{
+        if (!validModels.length) {{
+          optionsEl.innerHTML = '<div class="meta">当前没有可切换的有效模型。</div>';
+        }} else {{
+          optionsEl.innerHTML = validModels.map((row, idx) => {{
+            const id = String((row && row.id) || '').trim();
+            const inputId = `model-switch-option-${{idx}}`;
+            const checked = id === modelModalState.currentModel ? 'checked' : '';
+            const active = checked ? 'active' : '';
+            return `
+              <label class="model-option ${{active}}" for="${{inputId}}">
+                <div class="form-check mb-0">
+                  <input class="form-check-input" type="radio" name="model-switch-option" id="${{inputId}}" value="${{escapeHtml(id)}}" ${{checked}}>
+                  <span class="form-check-label">${{escapeHtml(modelOptionLabel(row))}}</span>
+                </div>
+                <div class="meta">${{escapeHtml(id)}}</div>
+              </label>
+            `;
+          }}).join('');
+          optionsEl.querySelectorAll('input[name="model-switch-option"]').forEach((input) => {{
+            input.addEventListener('change', () => {{
+              optionsEl.querySelectorAll('.model-option').forEach((el) => el.classList.remove('active'));
+              const wrapper = input.closest('.model-option');
+              if (wrapper) wrapper.classList.add('active');
+            }});
+          }});
+        }}
       }}
 
-      return `
-        <div class="model-switcher" data-kind="${{escapeHtml(kind)}}" data-id="${{escapeHtml(entityId)}}">
-          <select class="model-select">${{opts.join('')}}</select>
-          <button class="btn-monitor btn-model-save">保存</button>
-          <span class="model-status"></span>
-        </div>
-      `;
+      const modalEl = document.getElementById('model-switch-modal');
+      if (!modalEl) return;
+      bootstrap.Modal.getOrCreateInstance(modalEl).show();
     }}
 
-    function bindModelSwitchers(kind) {{
-      document.querySelectorAll(`.model-switcher[data-kind="${{kind}}"]`).forEach((node) => {{
-        const button = node.querySelector('.btn-model-save');
-        const select = node.querySelector('.model-select');
-        const status = node.querySelector('.model-status');
-        if (!button || !select || !status) return;
-        button.onclick = async () => {{
-          const entityId = node.getAttribute('data-id');
-          const model = select.value;
-          const headers = {{}};
-          if (token()) headers['Authorization'] = 'Bearer ' + token();
-          button.disabled = true;
-          status.textContent = '保存中...';
+    function bindModelSwitchButtons(kind) {{
+      document.querySelectorAll(`.btn-model-switch[data-kind="${{kind}}"]`).forEach((btn) => {{
+        btn.onclick = () => {{
+          let models = [];
           try {{
-            const url = kind === 'agent'
-              ? `/api/agents/${{encodeURIComponent(entityId)}}/model`
-              : `/api/crons/${{encodeURIComponent(entityId)}}/model`;
-            await postJson(url, {{ model }}, headers);
-            status.textContent = '已保存';
-            if (kind === 'agent') {{
-              await refreshOne('agents', true);
-            }} else {{
-              await refreshOne('crons', true);
-            }}
-          }} catch (e) {{
-            status.textContent = '保存失败';
-            console.warn('model switch failed', e);
-          }} finally {{
-            button.disabled = false;
-            setTimeout(() => {{
-              if (status.textContent === '已保存') status.textContent = '';
-            }}, 1500);
-          }}
+            models = JSON.parse(decodeURIComponent(btn.getAttribute('data-models') || '[]'));
+          }} catch (e) {{}}
+          openModelSwitchModal(
+            btn.getAttribute('data-kind') || kind,
+            btn.getAttribute('data-id') || '',
+            btn.getAttribute('data-current-model') || '',
+            models,
+          );
         }};
       }});
+    }}
+
+    function bindModelSwitchModal() {{
+      const modalEl = document.getElementById('model-switch-modal');
+      const saveBtn = $('#model-switch-save');
+      const statusEl = $('#model-switch-status');
+      const optionsEl = $('#model-switch-options');
+      if (!modalEl || !saveBtn || !statusEl || !optionsEl) return;
+
+      modalEl.addEventListener('hidden.bs.modal', () => {{
+        statusEl.textContent = '';
+      }});
+
+      saveBtn.onclick = async () => {{
+        const selected = optionsEl.querySelector('input[name="model-switch-option"]:checked');
+        if (!selected) {{
+          statusEl.textContent = '请选择模型';
+          return;
+        }}
+
+        const model = String(selected.value || '').trim();
+        if (!model) {{
+          statusEl.textContent = '请选择模型';
+          return;
+        }}
+
+        const headers = {{}};
+        if (token()) headers['Authorization'] = 'Bearer ' + token();
+        saveBtn.disabled = true;
+        statusEl.textContent = '保存中...';
+
+        try {{
+          const url = modelModalState.kind === 'agent'
+            ? `/api/agents/${{encodeURIComponent(modelModalState.entityId)}}/model`
+            : `/api/crons/${{encodeURIComponent(modelModalState.entityId)}}/model`;
+          await postJson(url, {{ model }}, headers);
+          bootstrap.Modal.getOrCreateInstance(modalEl).hide();
+          if (modelModalState.kind === 'agent') {{
+            refreshOne('agents', true);
+          }} else {{
+            refreshOne('crons', true);
+          }}
+        }} catch (e) {{
+          statusEl.textContent = '保存失败: ' + (e.message || e);
+          console.warn('model switch failed', e);
+        }} finally {{
+          saveBtn.disabled = false;
+        }}
+      }};
     }}
 
     function fmtBytes(n) {{
@@ -2929,11 +3053,38 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const p = m.plugin || {{}};
       const pDescEl = $('#memory-plugin-desc');
       if (pDescEl) {{
-        const lines = [];
-        lines.push(`插件: ${{p.id || '-'}}（别名: ${{p.alias || '-'}}）`);
-        lines.push(`状态: ${{p.enabled ? 'enabled' : 'disabled'}}`);
-        (p.description || []).forEach(x => lines.push(`- ${{x}}`));
-        pDescEl.textContent = lines.join('\\n');
+        const details = [
+          ['插件 ID', p.id || '-'],
+          ['别名', p.alias || '-'],
+          ['状态', p.enabled ? 'enabled' : 'disabled'],
+        ];
+        pDescEl.innerHTML = `
+          <div class="memory-list-item">
+            ${{details.map(([k, v]) => `<div class="kv-row"><div class="kv-key">${{escapeHtml(k)}}</div><div class="kv-value">${{escapeHtml(v)}}</div></div>`).join('')}}
+          </div>
+          ${{(p.description || []).map((x) => `<div class="memory-list-item">${{escapeHtml(x)}}</div>`).join('')}}
+        `;
+      }}
+
+      const storageEl = $('#memory-storage-summary');
+      if (storageEl) {{
+        const central = m.central || {{}};
+        const storage = m.storage || {{}};
+        const rows = [
+          ['central topics', fmtNum(central.topicsCount || 0)],
+          ['memories-md', fmtNum(central.memoriesMdCount || 0)],
+          ['最新 topic 更新时间', fmtTime(central.latestTopicAt)],
+          ['MEMORY.md', central.hasMemoryMd ? '已存在' : '未发现'],
+          ['SQLite 文件', `${{fmtNum(storage.sqliteCount || 0)}} · ${{fmtBytes(storage.sqliteBytes || 0)}}`],
+          ['LanceDB 体积', fmtBytes(storage.lancedbBytes || 0)],
+          ['backups', fmtNum(storage.backupCount || 0)],
+        ];
+        storageEl.innerHTML = rows.map(([k, v]) => `
+          <div class="kv-row">
+            <div class="kv-key">${{escapeHtml(k)}}</div>
+            <div class="kv-value">${{escapeHtml(v)}}</div>
+          </div>
+        `).join('');
       }}
 
       const impacts = m.impacts || {{}};
@@ -2941,20 +3092,30 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       if (impEl) {{
         const si = impacts.selfImprove || {{}};
         const iv = impacts.involve || {{}};
-        const lines = [];
 
-        lines.push(`self-improve 影响任务数: ${{fmtNum(si.count || 0)}}`);
-        (si.items || []).forEach((it, idx) => {{
-          lines.push(`  ${{idx + 1}}. ${{it.name}} | ${{it.enabled ? 'enabled' : 'disabled'}} | last=${{it.lastStatus || '-'}} | ${{it.effect || ''}}`);
-        }});
+        function renderImpactGroup(title, group) {{
+          const items = Array.isArray(group.items) ? group.items : [];
+          return `
+            <div class="memory-list-item">
+              <strong>${{escapeHtml(title)}}</strong>
+              <div class="meta">影响任务数：${{fmtNum(group.count || 0)}}</div>
+              ${{items.length ? items.map((it) => `
+                <div class="kv-row">
+                  <div>
+                    <div>${{escapeHtml(it.name || '-')}}</div>
+                    <div class="meta">${{escapeHtml(it.effect || '')}}</div>
+                  </div>
+                  <div class="kv-value">${{it.enabled ? 'enabled' : 'disabled'}}<br>${{escapeHtml(it.lastStatus || '-')}}</div>
+                </div>
+              `).join('') : '<div class="meta">未发现关联任务</div>'}}
+            </div>
+          `;
+        }}
 
-        lines.push('');
-        lines.push(`involve 影响任务数: ${{fmtNum(iv.count || 0)}}`);
-        (iv.items || []).forEach((it, idx) => {{
-          lines.push(`  ${{idx + 1}}. ${{it.name}} | ${{it.enabled ? 'enabled' : 'disabled'}} | last=${{it.lastStatus || '-'}} | ${{it.effect || ''}}`);
-        }});
-
-        impEl.textContent = lines.join('\\n');
+        impEl.innerHTML = [
+          renderImpactGroup('self-improve', si),
+          renderImpactGroup('involve', iv),
+        ].join('');
       }}
     }}
 
@@ -3056,6 +3217,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     paintCountdown();
     bootstrapRefresh();
+    bindModelSwitchModal();
 
     setInterval(() => {{
       if (document.hidden) return;
