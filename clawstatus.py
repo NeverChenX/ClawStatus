@@ -1710,7 +1710,62 @@ def _build_cron_monitor_text(job: Dict[str, Any]) -> str:
     return txt[:7000]
 
 
+def _humanize_cron_expr(expr: str, tz: str = "") -> str:
+    expr = str(expr or "").strip()
+    if not expr:
+        return "-"
+
+    parts = expr.split()
+    if len(parts) != 5:
+        return f"{expr} ({tz})" if tz else expr
+
+    minute, hour, dom, month, dow = parts
+    dow_map = {
+        "0": "周日",
+        "1": "周一",
+        "2": "周二",
+        "3": "周三",
+        "4": "周四",
+        "5": "周五",
+        "6": "周六",
+        "7": "周日",
+    }
+
+    def _fmt_hm(h: str, m: str) -> Optional[str]:
+        if h.isdigit() and m.isdigit():
+            return f"{int(h):02d}:{int(m):02d}"
+        return None
+
+    label: Optional[str] = None
+    hm = _fmt_hm(hour, minute)
+    if dom == "*" and month == "*" and dow == "*" and hm:
+        label = f"每天 {hm}"
+    elif dom == "*" and month == "*" and dow in dow_map and hm:
+        label = f"{dow_map[dow]} {hm}"
+    elif dom == "*" and month == "*" and hour == "*" and minute.startswith("*/"):
+        label = f"每{minute[2:]}分钟"
+    elif dom == "*" and month == "*" and minute.isdigit() and hour.startswith("*/"):
+        label = f"每{hour[2:]}小时 {int(minute):02d}分"
+    elif dom == "*" and month == "*" and dow == "*" and minute.isdigit() and hour == "*":
+        label = f"每小时 {int(minute):02d}分"
+    elif dom.isdigit() and month == "*" and dow == "*" and hm:
+        label = f"每月{int(dom)}日 {hm}"
+
+    if label:
+        return f"{label}（{tz}）" if tz else label
+    return f"{expr} ({tz})" if tz else expr
+
+
 def _describe_schedule(schedule: Any) -> str:
+    if isinstance(schedule, str):
+        raw = schedule.strip()
+        if not raw:
+            return "-"
+        if raw.endswith(")") and " (" in raw:
+            expr, tz = raw.rsplit(" (", 1)
+            return _humanize_cron_expr(expr.strip(), tz[:-1].strip())
+        return _humanize_cron_expr(raw)
+
     if not isinstance(schedule, dict):
         return "-"
 
@@ -1731,42 +1786,7 @@ def _describe_schedule(schedule: Any) -> str:
     if kind == "cron":
         expr = str(schedule.get("expr") or "").strip() or "-"
         tz = str(schedule.get("tz") or "").strip()
-        parts = expr.split()
-        if len(parts) == 5:
-            minute, hour, dom, month, dow = parts
-            dow_map = {
-                "0": "周日",
-                "1": "周一",
-                "2": "周二",
-                "3": "周三",
-                "4": "周四",
-                "5": "周五",
-                "6": "周六",
-                "7": "周日",
-            }
-
-            def _fmt_hm(h: str, m: str) -> Optional[str]:
-                if h.isdigit() and m.isdigit():
-                    return f"{int(h):02d}:{int(m):02d}"
-                return None
-
-            label: Optional[str] = None
-            hm = _fmt_hm(hour, minute)
-            if dom == "*" and month == "*" and dow == "*" and hm:
-                label = f"每天 {hm}"
-            elif dom == "*" and month == "*" and dow in dow_map and hm:
-                label = f"{dow_map[dow]} {hm}"
-            elif dom == "*" and month == "*" and hour == "*" and minute.startswith("*/"):
-                label = f"每{minute[2:]}分钟"
-            elif dom == "*" and month == "*" and minute.isdigit() and hour.startswith("*/"):
-                label = f"每{hour[2:]}小时 {int(minute):02d}分"
-            elif dom == "*" and month == "*" and dow == "*" and minute.isdigit() and hour == "*":
-                label = f"每小时 {int(minute):02d}分"
-            elif dom.isdigit() and month == "*" and dow == "*" and hm:
-                label = f"每月{int(dom)}日 {hm}"
-            if label:
-                return f"{label} · {expr} ({tz})" if tz else f"{label} · {expr}"
-        return f"{expr} ({tz})" if tz else expr
+        return _humanize_cron_expr(expr, tz)
 
     if kind == "at":
         return str(schedule.get("at") or "-")
@@ -3209,9 +3229,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     }}
 
     function renderCronTable(data) {{
-      const crons = (data || {{}}).jobs || [];
-      const cronModels = (data || {{}}).availableModels || [];
-      const hasAgentAssociation = !!((data || {{}}).hasAgentAssociation);
+      const crons = (data || {}).jobs || [];
+      const cronModels = (data || {}).availableModels || [];
       cronMap.clear();
       crons.forEach(c => cronMap.set(c.id, c));
 
@@ -3220,7 +3239,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         head.innerHTML = `
           <tr>
             <th>${{t('task')}}</th>
-            ${{hasAgentAssociation ? `<th>${{t('agent')}}</th>` : ''}}
             <th>${{t('schedule')}}</th>
             <th>${{t('running')}}</th>
             <th>${{t('model')}}</th>
@@ -3233,11 +3251,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       }}
 
       const cronsBody = $('#crons-body');
-      const colspan = hasAgentAssociation ? 9 : 8;
+      const colspan = 8;
       cronsBody.innerHTML = crons.map(c => `
         <tr>
           <td>${{escapeHtml(c.name || c.id || '-')}}</td>
-          ${{hasAgentAssociation ? `<td>${{escapeHtml(c.agentId || '-')}}</td>` : ''}}
           <td>${{escapeHtml(c.scheduleText || '-')}}</td>
           <td>${{c.running ? `<span class="ok">${{t('runningNow')}}</span>` : '<span class="muted">-</span>'}}</td>
           <td>${{escapeHtml(c.currentModel || '-')}}</td>
@@ -3264,7 +3281,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       listEl.innerHTML = (crons || []).map(c => `
         <button class="monitor-list-item ${{selectedCronId === c.id ? 'active' : ''}}" data-cron-id="${{c.id}}">
           <div><strong>${{c.name}}</strong></div>
-          <div class="meta">${{c.agentId || '-'}} · ${{c.running ? '运行中' : (c.enabled ? '等待中' : '未启用')}}</div>
+          <div class="meta">${{c.scheduleText || '-'}} · ${{c.running ? '运行中' : (c.enabled ? '等待中' : '未启用')}}</div>
         </button>
       `).join('') || '<div class="meta">暂无任务</div>';
 
@@ -3281,7 +3298,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       selectedCronId = id;
       renderCronMonitorList(Array.from(cronMap.values()));
 
-      if (detailTitle) detailTitle.textContent = `执行内容 · ${{c.name}}（${{c.agentId || '-'}}）`;
+      if (detailTitle) detailTitle.textContent = `执行内容 · ${{c.name}}（${{c.scheduleText || '-'}}）`;
 
       if (cronMonitorCache.has(id)) {{
         detailEl.textContent = cronMonitorCache.get(id);
