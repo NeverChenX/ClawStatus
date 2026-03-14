@@ -32,7 +32,7 @@ try:
 except Exception:  # pragma: no cover
     waitress_serve = None
 
-__version__ = "2.0.1"
+__version__ = "2.2.0"
 APP_TITLE = "ClawStatus"
 
 HOME = Path.home()
@@ -158,6 +158,23 @@ def _fmt_duration_ms(ms: Optional[int]) -> str:
         return f"{mins}m{s:02d}s"
     hrs, m = divmod(mins, 60)
     return f"{hrs}h{m:02d}m"
+
+def _is_meaningful_agent_id(value: Any) -> bool:
+    agent_id = str(value or "").strip()
+    if not agent_id or agent_id == "-":
+        return False
+    return agent_id.lower() not in {"none", "unknown", "auto", "default"}
+
+
+def _status_tone(status: Any) -> str:
+    s = str(status or "").strip().lower()
+    if s in {"ok", "success", "succeeded", "completed", "complete", "done"}:
+        return "ok"
+    if s in {"error", "failed", "fail", "timeout", "timed_out", "cancelled", "canceled"}:
+        return "bad"
+    if s in {"running", "started", "processing", "in_progress", "pending", "queued"}:
+        return "warn"
+    return "muted"
 
 
 def _extract_json_blob(text: str) -> Optional[Dict[str, Any]]:
@@ -1379,6 +1396,13 @@ def _collect_memory_data(
                 pass
         return s
 
+    openclaw_config = _safe_read_json(OPENCLAW_CONFIG, {})
+    plugins_cfg = openclaw_config.get("plugins", {}) if isinstance(openclaw_config, dict) else {}
+    plugin_slots = plugins_cfg.get("slots", {}) if isinstance(plugins_cfg, dict) else {}
+    plugin_entries = plugins_cfg.get("entries", {}) if isinstance(plugins_cfg, dict) else {}
+    hooks_cfg = openclaw_config.get("hooks", {}) if isinstance(openclaw_config, dict) else {}
+    internal_hooks = (((hooks_cfg.get("internal") or {}) if isinstance(hooks_cfg, dict) else {}).get("entries") or {})
+
     memory_root = OPENCLAW_DIR / "memory"
     sqlite_files = [f for f in memory_root.glob("*.sqlite") if f.is_file()] if memory_root.exists() else []
     backups_dir = memory_root / "backups"
@@ -1398,10 +1422,6 @@ def _collect_memory_data(
     if topic_files:
         latest_topic_at = int(max(f.stat().st_mtime for f in topic_files) * 1000)
 
-    memory_plugin = ((status_data or {}).get("memoryPlugin") or {}) if isinstance(status_data, dict) else {}
-    plugin_slot = str(memory_plugin.get("slot") or "memory-lancedb-pro")
-    plugin_enabled = bool(memory_plugin.get("enabled", bool(lancedb_size > 0)))
-
     jobs = (crons_data or {}).get("jobs", []) if isinstance(crons_data, dict) else []
 
     def _job_row(j: Dict[str, Any], effect: str) -> Dict[str, Any]:
@@ -1409,6 +1429,7 @@ def _collect_memory_data(
             "name": j.get("name") or j.get("id") or "-",
             "enabled": bool(j.get("enabled", False)),
             "lastStatus": j.get("lastStatus") or "-",
+            "lastStatusTone": _status_tone(j.get("lastStatus")),
             "nextRunAtMs": j.get("nextRunAtMs"),
             "lastRunAtMs": j.get("lastRunAtMs"),
             "effect": effect,
@@ -1416,12 +1437,33 @@ def _collect_memory_data(
 
     self_improve_rows: List[Dict[str, Any]] = []
     involve_rows: List[Dict[str, Any]] = []
+    automation_rows: List[Dict[str, Any]] = []
 
     for j in jobs:
         if not isinstance(j, dict):
             continue
         name = str(j.get("name") or "")
         low = name.lower()
+        schedule_text = str(j.get("scheduleText") or "-")
+        current_model = str(j.get("currentModel") or "").strip() or "-"
+        payload = j.get("payload") if isinstance(j.get("payload"), dict) else {}
+
+        payload_text = ""
+        if isinstance(payload, dict):
+            for key in ("message", "prompt", "task", "description", "notes", "text"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    payload_text = value.lower()
+                    break
+
+        if "memory" in low or "memory-central" in low or "memory" in payload_text:
+            automation_rows.append(
+                {
+                    **_job_row(j, "通过定时任务维护、提炼或使用 memory 数据。"),
+                    "scheduleText": schedule_text,
+                    "currentModel": current_model,
+                }
+            )
 
         if (
             "自我升级" in name
@@ -1450,6 +1492,126 @@ def _collect_memory_data(
                 )
             )
 
+    capabilities: List[Dict[str, Any]] = []
+
+    def _append_capability(
+        cap_id: str,
+        title: str,
+        source: str,
+        status: str,
+        detail: str,
+        evidence: Optional[List[str]] = None,
+    ) -> None:
+        capabilities.append(
+            {
+                "id": cap_id,
+                "title": title,
+                "source": source,
+                "status": status,
+                "detail": detail,
+                "evidence": evidence or [],
+            }
+        )
+
+    memory_slot = str(plugin_slots.get("memory") or "").strip()
+    if memory_slot and memory_slot.lower() != "none":
+        slot_entry = plugin_entries.get(memory_slot) if isinstance(plugin_entries, dict) else {}
+        slot_enabled = bool(slot_entry.get("enabled")) if isinstance(slot_entry, dict) else False
+        _append_capability(
+            f"slot:{memory_slot}",
+            f"活动 Memory 插槽: {memory_slot}",
+            "config",
+            "active" if slot_enabled else "configured",
+            "当前 memory 插槽来自 openclaw.json 配置。",
+            [f"plugins.slots.memory = {memory_slot}"],
+        )
+
+    for plugin_id in ("memory-core", "memory-lancedb"):
+        entry = plugin_entries.get(plugin_id) if isinstance(plugin_entries, dict) else None
+        if not isinstance(entry, dict):
+            continue
+        enabled = bool(entry.get("enabled", False))
+        _append_capability(
+            f"plugin:{plugin_id}",
+            plugin_id,
+            "config",
+            "active" if enabled else "available",
+            "插件条目存在于 openclaw.json。" if enabled else "插件已配置，但当前未启用。",
+            [f"plugins.entries.{plugin_id}.enabled = {str(enabled).lower()}"],
+        )
+
+    session_memory_hook = internal_hooks.get("session-memory") if isinstance(internal_hooks, dict) else None
+    if isinstance(session_memory_hook, dict):
+        enabled = bool(session_memory_hook.get("enabled", False))
+        _append_capability(
+            "hook:session-memory",
+            "session-memory hook",
+            "config",
+            "active" if enabled else "available",
+            "内部 hook 会在会话层处理记忆沉淀。",
+            [f"hooks.internal.entries.session-memory.enabled = {str(enabled).lower()}"],
+        )
+
+    if central_dir.exists():
+        _append_capability(
+            "data:memory-central",
+            "memory-central",
+            "filesystem",
+            "active",
+            f"集中记忆中心已存在，包含 {len(topic_files)} 个 topic 与 {len(memories_md_files)} 个 memories-md 文件。",
+            [str(central_dir)],
+        )
+
+    if workspace_rows:
+        _append_capability(
+            "data:workspace-memory",
+            "workspace memory",
+            "filesystem",
+            "active",
+            f"检测到 {len(workspace_rows)} 个工作区 memory 目录，共 {total_entries} 条 Markdown 记忆。",
+            [str(OPENCLAW_DIR / 'workspace')],
+        )
+
+    if sqlite_files:
+        _append_capability(
+            "data:sqlite-memory",
+            "SQLite memory store",
+            "filesystem",
+            "active",
+            f"检测到 {len(sqlite_files)} 个 SQLite 记忆库，合计 {_sum_size(sqlite_files)} 字节。",
+            [str(memory_root)],
+        )
+
+    if lancedb_size > 0:
+        _append_capability(
+            "data:lancedb-store",
+            "LanceDB data store",
+            "filesystem",
+            "active",
+            f"检测到 LanceDB 数据目录，体积 {lancedb_size} 字节。该项仅说明现有向量数据仍在磁盘上。",
+            [str(lancedb_dir)],
+        )
+
+    if backup_files:
+        _append_capability(
+            "data:memory-backups",
+            "memory backups",
+            "filesystem",
+            "active",
+            f"检测到 {len(backup_files)} 个 memory backup 文件。",
+            [str(backups_dir)],
+        )
+
+    if automation_rows:
+        _append_capability(
+            "automation:memory-crons",
+            "memory-related crons",
+            "runtime",
+            "active",
+            f"检测到 {len(automation_rows)} 个与 memory 相关的启用 cron。",
+            [CRON_JOBS_PATH.as_posix()],
+        )
+
     payload = {
         "summary": {
             "workspaceCount": len(workspace_rows),
@@ -1472,16 +1634,8 @@ def _collect_memory_data(
             "lancedbBytes": lancedb_size,
             "backupCount": len(backup_files),
         },
-        "plugin": {
-            "id": plugin_slot,
-            "alias": "memory-pro",
-            "enabled": plugin_enabled,
-            "description": [
-                "memory-lancedb-pro（memory-pro）用于长期记忆的存储、检索与治理。",
-                "建议仅写入可复用偏好/事实/决策，避免写入密钥与 untrusted metadata 噪声。",
-                "关键记忆写入后应使用 memory_recall 进行可检索验证。",
-            ],
-        },
+        "capabilities": capabilities,
+        "automations": automation_rows,
         "impacts": {
             "selfImprove": {
                 "count": len(self_improve_rows),
@@ -1577,6 +1731,41 @@ def _describe_schedule(schedule: Any) -> str:
     if kind == "cron":
         expr = str(schedule.get("expr") or "").strip() or "-"
         tz = str(schedule.get("tz") or "").strip()
+        parts = expr.split()
+        if len(parts) == 5:
+            minute, hour, dom, month, dow = parts
+            dow_map = {
+                "0": "周日",
+                "1": "周一",
+                "2": "周二",
+                "3": "周三",
+                "4": "周四",
+                "5": "周五",
+                "6": "周六",
+                "7": "周日",
+            }
+
+            def _fmt_hm(h: str, m: str) -> Optional[str]:
+                if h.isdigit() and m.isdigit():
+                    return f"{int(h):02d}:{int(m):02d}"
+                return None
+
+            label: Optional[str] = None
+            hm = _fmt_hm(hour, minute)
+            if dom == "*" and month == "*" and dow == "*" and hm:
+                label = f"每天 {hm}"
+            elif dom == "*" and month == "*" and dow in dow_map and hm:
+                label = f"{dow_map[dow]} {hm}"
+            elif dom == "*" and month == "*" and hour == "*" and minute.startswith("*/"):
+                label = f"每{minute[2:]}分钟"
+            elif dom == "*" and month == "*" and minute.isdigit() and hour.startswith("*/"):
+                label = f"每{hour[2:]}小时 {int(minute):02d}分"
+            elif dom == "*" and month == "*" and dow == "*" and minute.isdigit() and hour == "*":
+                label = f"每小时 {int(minute):02d}分"
+            elif dom.isdigit() and month == "*" and dow == "*" and hm:
+                label = f"每月{int(dom)}日 {hm}"
+            if label:
+                return f"{label} · {expr} ({tz})" if tz else f"{label} · {expr}"
         return f"{expr} ({tz})" if tz else expr
 
     if kind == "at":
@@ -1592,10 +1781,16 @@ def _collect_cron_data() -> Dict[str, Any]:
 
     running = 0
     normalized_jobs = []
+    enabled_total = 0
+    agent_ids: List[str] = []
 
     for job in jobs:
         if not isinstance(job, dict):
             continue
+        enabled = bool(job.get("enabled", False))
+        if not enabled:
+            continue
+        enabled_total += 1
         job_id = str(job.get("id") or "")
         run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
         last_event = _read_last_jsonl_obj(run_file)
@@ -1624,35 +1819,38 @@ def _collect_cron_data() -> Dict[str, Any]:
         if is_running:
             running += 1
 
+        agent_id = str(job.get("agentId") or "").strip()
+        if _is_meaningful_agent_id(agent_id):
+            agent_ids.append(agent_id)
+
         normalized_jobs.append(
             {
                 "id": job_id,
                 "name": job.get("name") or job_id,
-                "agentId": job.get("agentId") or "-",
-                "enabled": bool(job.get("enabled", False)),
+                "agentId": agent_id or "-",
+                "enabled": enabled,
                 "running": is_running,
                 "lastStatus": last_status_raw,
+                "lastStatusTone": _status_tone(last_status_raw),
                 "lastRunAtMs": state.get("lastRunAtMs"),
                 "nextRunAtMs": state.get("nextRunAtMs"),
                 "lastDurationMs": state.get("lastDurationMs"),
                 "schedule": job.get("schedule") or {},
                 "scheduleText": _describe_schedule(job.get("schedule") or {}),
                 "currentModel": str(((job.get("payload") or {}) if isinstance(job.get("payload"), dict) else {}).get("model") or "").strip() or "-",
+                "payload": job.get("payload") if isinstance(job.get("payload"), dict) else {},
             }
         )
 
-    normalized_jobs.sort(
-        key=lambda x: (not x.get("enabled", False), x.get("nextRunAtMs") or 10**18)
-    )
-
-    enabled_count = sum(1 for j in normalized_jobs if j["enabled"])
-    disabled_count = len(normalized_jobs) - enabled_count
+    normalized_jobs.sort(key=lambda x: (x.get("nextRunAtMs") or 10**18, x.get("name") or ""))
+    distinct_agent_ids = sorted(set(agent_ids))
 
     return {
         "total": len(normalized_jobs),
-        "enabled": enabled_count,
-        "disabled": disabled_count,
+        "enabled": len(normalized_jobs),
+        "disabled": max(0, len(jobs) - enabled_total),
         "running": running,
+        "hasAgentAssociation": len(distinct_agent_ids) > 1,
         "availableModels": available_models,
         "jobs": normalized_jobs,
     }
@@ -1969,7 +2167,8 @@ def _empty_dashboard_payload() -> Dict[str, Any]:
             "recent": [],
             "central": {"exists": False, "hasMemoryMd": False, "topicsCount": 0, "memoriesMdCount": 0, "latestTopicAt": None},
             "storage": {"sqliteCount": 0, "sqliteBytes": 0, "lancedbBytes": 0, "backupCount": 0},
-            "plugin": {"id": "memory-lancedb-pro", "alias": "memory-pro", "enabled": False, "description": []},
+            "capabilities": [],
+            "automations": [],
             "impacts": {"selfImprove": {"count": 0, "items": []}, "involve": {"count": 0, "items": []}},
         },
         "openclaw": {"ok": False, "state": "加载中", "error": "warming up", "gateway": {}, "security": {}, "update": {}, "channels": []},
@@ -2273,7 +2472,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{APP_TITLE}</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" />
   <style>
     :root {{
       --bg: #05070d;
@@ -2305,13 +2503,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       backdrop-filter: blur(8px);
       z-index: 10;
       display: grid;
-      grid-template-columns: auto 1fr;
+      grid-template-columns: auto 1fr auto;
       align-items: center;
       gap: 12px;
     }}
     h1 {{ margin: 0; font-size: 22px; font-weight: 700; justify-self: start; }}
     .wrap {{ padding: 14px 24px 28px; max-width: 1500px; margin: 0 auto; }}
     .nav {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 0; justify-content: center; }}
+    .header-actions {{ display:flex; align-items:center; gap:10px; justify-self:end; }}
+    .lang-toggle {{ display:flex; gap:6px; }}
+    .lang-btn {{ border:1px solid var(--line); background:var(--card); color:var(--muted); border-radius:999px; padding:6px 10px; font-size:12px; cursor:pointer; }}
+    .lang-btn.active {{ color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }}
     .nav-tab {{ border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; }}
     .nav-tab.active {{ border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }}
     .page {{ display: none; }}
@@ -2324,10 +2526,14 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .k {{ color: var(--muted); font-size: 12px; }}
     .v {{ font-size: 24px; font-weight: 700; margin-top: 6px; }}
     .v.sm {{ font-size: 18px; }}
-    .ok {{ color: var(--ok); }} .warn {{ color: var(--warn); }} .bad {{ color: var(--bad); }}
+    .ok {{ color: var(--ok); }} .warn {{ color: var(--warn); }} .bad {{ color: var(--bad); }} .muted {{ color: var(--muted); }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
     th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: top; }}
     th {{ color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }}
+    .table-hover tbody tr:hover {{ background: rgba(96,165,250,.05); }}
+    .align-middle td, .align-middle th {{ vertical-align: middle; }}
+    .mb-0 {{ margin-bottom: 0; }}
+    .me-auto {{ margin-right: auto; }}
     .panel {{ margin-top: 14px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }}
     .meta {{ color: var(--muted); font-size: 12px; margin-top: 10px; }}
     .pill {{ display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 8px; font-size:11px; color:var(--muted); margin-left: 6px; background: var(--bg2); }}
@@ -2357,6 +2563,15 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .memory-list-item {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--bg2); }}
     .memory-list-item strong {{ display: block; margin-bottom: 4px; }}
     .memory-list-item .meta {{ margin-top: 4px; }}
+    .memory-cap-grid {{ display:grid; gap:8px; }}
+    .memory-cap-head {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
+    .memory-cap-title {{ font-size: 14px; font-weight: 600; }}
+    .status-chip {{ display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:2px 8px; border:1px solid var(--line); font-size:11px; }}
+    .status-chip.active, .status-chip.ok {{ color: var(--ok); border-color: rgba(34,197,94,.35); }}
+    .status-chip.available, .status-chip.warn {{ color: var(--warn); border-color: rgba(245,158,11,.35); }}
+    .status-chip.bad {{ color: var(--bad); border-color: rgba(248,113,113,.35); }}
+    .status-chip.configured, .status-chip.muted {{ color: var(--muted); }}
+    .next-run {{ white-space: nowrap; }}
     .daily-chart {{ display:flex; align-items:flex-end; justify-content:space-between; gap:10px; min-height:240px; padding: 10px 6px 0; overflow: hidden; }}
     .daily-item {{ flex: 1 1 0; min-width: 44px; max-width: 72px; text-align:center; }}
     .daily-bar-wrap {{ height: 160px; display:flex; align-items:flex-end; justify-content:center; }}
@@ -2371,7 +2586,25 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .daily-list {{ margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }}
     #flow-svg {{ width: 100%; height: 240px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }}
     #boot-overlay {{ display: none; }}
-    @media (max-width: 1200px) {{ header {{ grid-template-columns: 1fr; }} h1 {{ justify-self: center; }} .nav {{ justify-content: center; }} }}
+    .btn {{ border-radius:8px; padding:8px 12px; cursor:pointer; font-size:13px; }}
+    .btn-secondary {{ background:var(--bg2); border:1px solid var(--line); color:var(--text); }}
+    .btn-primary {{ background:var(--accent); border:1px solid var(--accent); color:#fff; }}
+    .btn:disabled {{ opacity:.6; cursor:not-allowed; }}
+    .btn-close {{ width:32px; height:32px; border:0; background:transparent; color:var(--text); cursor:pointer; position:relative; }}
+    .btn-close::before, .btn-close::after {{ content:''; position:absolute; left:15px; top:7px; width:2px; height:18px; background:currentColor; }}
+    .btn-close::before {{ transform:rotate(45deg); }}
+    .btn-close::after {{ transform:rotate(-45deg); }}
+    .form-check {{ display:flex; align-items:center; gap:8px; }}
+    .form-check-input {{ margin:0; }}
+    .modal {{ display:none; position:fixed; inset:0; z-index:1000; }}
+    .modal.open {{ display:block; }}
+    .modal-backdrop {{ position:absolute; inset:0; background:rgba(0,0,0,.55); }}
+    .modal-dialog {{ position:relative; width:min(560px, calc(100vw - 24px)); margin:6vh auto; max-height:88vh; overflow:hidden; }}
+    .modal-content {{ display:flex; flex-direction:column; max-height:88vh; border-radius:12px; overflow:hidden; }}
+    .modal-header, .modal-footer {{ display:flex; align-items:center; gap:12px; padding:14px 16px; }}
+    .modal-body {{ padding:14px 16px; overflow:auto; }}
+    body.modal-open {{ overflow:hidden; }}
+    @media (max-width: 1200px) {{ header {{ grid-template-columns: 1fr; }} h1 {{ justify-self: center; }} .nav {{ justify-content: center; }} .header-actions {{ justify-self:center; }} }}
     @media (max-width: 1000px) {{ .grid {{ grid-template-columns: repeat(2,minmax(160px,1fr)); }} .monitor-grid {{ grid-template-columns: 1fr; }} .memory-layout {{ grid-template-columns: 1fr; }} .memory-meta-grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -2379,11 +2612,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
   <header>
     <h1>{APP_TITLE}</h1>
     <div class="nav">
-      <button class="nav-tab active" data-page="overview">Overview</button>
-      <button class="nav-tab" data-page="flow">Flow</button>
-      <button class="nav-tab" data-page="crons">Crons</button>
-      <button class="nav-tab" data-page="usage">Tokens</button>
-      <button class="nav-tab" data-page="memory">Memory</button>
+      <button class="nav-tab active" data-page="overview" data-i18n="navOverview">Overview</button>
+      <button class="nav-tab" data-page="flow" data-i18n="navFlow">Flow</button>
+      <button class="nav-tab" data-page="crons" data-i18n="navCrons">Crons</button>
+      <button class="nav-tab" data-page="usage" data-i18n="navTokens">Tokens</button>
+      <button class="nav-tab" data-page="memory" data-i18n="navMemory">Memory</button>
+    </div>
+    <div class="header-actions">
+      <div class="lang-toggle" aria-label="language toggle">
+        <button class="lang-btn" type="button" data-lang="zh">中文</button>
+        <button class="lang-btn" type="button" data-lang="en">EN</button>
+      </div>
     </div>
   </header>
   <div class="wrap">
@@ -2419,9 +2658,9 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     <section id="page-crons" class="page">
       <div class="panel">
-        <h3 style="margin:4px 0 8px">Cron 任务 <span class="pill" id="cd-crons">60秒后刷新</span></h3>
+        <h3 style="margin:4px 0 8px"><span data-i18n="cronsTitle">Cron 任务</span> <span class="pill" id="cd-crons">60秒后刷新</span></h3>
         <table class="table table-hover align-middle mb-0">
-          <thead><tr><th>任务</th><th>Agent</th><th>触发频率</th><th>启用</th><th>运行中</th><th>当前模型</th><th>上次状态</th><th>上次耗时</th><th>下次执行</th><th>切换模型</th></tr></thead>
+          <thead id="crons-head"></thead>
           <tbody id="crons-body"></tbody>
         </table>
       </div>
@@ -2452,7 +2691,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <div class="memory-layout">
         <div class="panel">
           <div class="memory-section-title">
-            <h3 style="margin:0">Memory 工作区概览</h3>
+            <h3 style="margin:0" data-i18n="memoryWorkspaceTitle">Memory 工作区概览</h3>
             <span class="pill" id="cd-memory">60秒后刷新</span>
           </div>
           <table class="table table-hover align-middle mb-0">
@@ -2462,21 +2701,25 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         </div>
         <div class="memory-meta-grid">
           <div class="panel">
-            <h3 style="margin:4px 0 8px">中央记忆与存储</h3>
+            <h3 style="margin:4px 0 8px" data-i18n="memoryCapabilitiesTitle">Memory 能力</h3>
+            <div id="memory-capabilities" class="memory-cap-grid">加载中…</div>
+          </div>
+          <div class="panel">
+            <h3 style="margin:4px 0 8px" data-i18n="memoryStorageTitle">中央记忆与存储</h3>
             <div id="memory-storage-summary" class="kv-list">加载中…</div>
           </div>
           <div class="panel">
-            <h3 style="margin:4px 0 8px">memory-pro 插件</h3>
-            <div id="memory-plugin-desc" class="memory-list">加载中…</div>
+            <h3 style="margin:4px 0 8px" data-i18n="memoryAutomationTitle">Memory 自动化</h3>
+            <div id="memory-automation" class="memory-list">加载中…</div>
           </div>
           <div class="panel" style="grid-column: 1 / -1;">
-            <h3 style="margin:4px 0 8px">self-improve / involve 对 memory 的影响</h3>
+            <h3 style="margin:4px 0 8px" data-i18n="memoryImpactTitle">self-improve / involve 对 memory 的影响</h3>
             <div id="memory-impact" class="memory-list">加载中…</div>
           </div>
         </div>
       </div>
       <div class="panel">
-        <h3 style="margin:4px 0 8px">最近 Memory 文件</h3>
+        <h3 style="margin:4px 0 8px" data-i18n="memoryRecentTitle">最近 Memory 文件</h3>
         <table class="table table-hover align-middle mb-0">
           <thead><tr><th>Workspace</th><th>文件</th><th>大小</th><th>更新时间</th></tr></thead>
           <tbody id="memory-recent-body"></tbody>
@@ -2485,7 +2728,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     </section>
   </div>
 
-  <div class="modal fade" id="model-switch-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal" id="model-switch-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-backdrop" data-modal-close="true"></div>
     <div class="modal-dialog modal-dialog-scrollable">
       <div class="modal-content" style="background:var(--card);color:var(--text);border:1px solid var(--line);">
         <div class="modal-header" style="border-bottom:1px solid var(--line);">
@@ -2493,21 +2737,19 @@ def _index_html(auth_token: Optional[str] = None) -> str:
             <h5 class="modal-title" id="model-switch-title" style="margin:0">切换模型</h5>
             <div class="model-current" id="model-switch-current">当前模型：-</div>
           </div>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" style="filter:invert(1);"></button>
+          <button type="button" class="btn-close" data-modal-close="true" aria-label="Close"></button>
         </div>
         <div class="modal-body">
           <div id="model-switch-options" class="model-options"></div>
         </div>
         <div class="modal-footer" style="border-top:1px solid var(--line);">
           <span class="model-status me-auto" id="model-switch-status"></span>
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" style="background:var(--bg2);border:1px solid var(--line);color:var(--text);">取消</button>
-          <button type="button" class="btn btn-primary" id="model-switch-save" style="background:var(--accent);border:none;color:#fff;">保存</button>
+          <button type="button" class="btn btn-secondary" data-modal-close="true" id="model-switch-cancel">取消</button>
+          <button type="button" class="btn btn-primary" id="model-switch-save">保存</button>
         </div>
       </div>
     </div>
   </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
   <script>
     const SERVER_TOKEN = '{auth_token or ''}';
     const $ = (s) => document.querySelector(s);
@@ -2533,6 +2775,181 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const m = Math.floor(s / 60);
       const rs = Math.round(s % 60);
       return `${{m}}m${{rs}}s`;
+    }};
+    const LANG_KEY = 'clawstatus-lang';
+    const I18N = {{
+      zh: {{
+        title: '{APP_TITLE}',
+        navOverview: '概览',
+        navFlow: '流转',
+        navCrons: 'Crons',
+        navTokens: 'Tokens',
+        navMemory: 'Memory',
+        cronsTitle: 'Cron 任务',
+        memoryWorkspaceTitle: 'Memory 工作区概览',
+        memoryCapabilitiesTitle: 'Memory 能力',
+        memoryStorageTitle: '中央记忆与存储',
+        memoryAutomationTitle: 'Memory 自动化',
+        memoryImpactTitle: 'self-improve / involve 对 memory 的影响',
+        memoryRecentTitle: '最近 Memory 文件',
+        loading: '加载中…',
+        noData: '暂无数据',
+        noTasks: '暂无任务',
+        autoRefresh: '状态自动刷新',
+        runningNow: '运行中',
+        idle: '空闲',
+        on: '开启',
+        off: '关闭',
+        yes: '是',
+        save: '保存',
+        cancel: '取消',
+        switchModel: '切换模型',
+        currentModel: '当前模型',
+        chooseModel: '请选择模型',
+        saving: '保存中...',
+        saveFailed: '保存失败',
+        noValidModels: '当前没有可切换的有效模型。',
+        schedule: '触发频率',
+        enabled: '启用',
+        running: '运行中',
+        lastStatus: '上次状态',
+        lastDuration: '上次耗时',
+        nextRun: '下次执行',
+        task: '任务',
+        agent: 'Agent',
+        model: '当前模型',
+        switchModelBtn: '切换模型',
+        workspace: 'Workspace',
+        entries: '条目数',
+        todayAdded: '今日新增',
+        latestFile: '最新文件',
+        updatedAt: '更新时间',
+        file: '文件',
+        size: '大小',
+        capabilitySource: '来源',
+        capabilityStatus: '状态',
+        automationEffect: '作用',
+        countdownSuffix: '后刷新',
+        overdue: '立即',
+      }},
+      en: {{
+        title: '{APP_TITLE}',
+        navOverview: 'Overview',
+        navFlow: 'Flow',
+        navCrons: 'Crons',
+        navTokens: 'Tokens',
+        navMemory: 'Memory',
+        cronsTitle: 'Cron Jobs',
+        memoryWorkspaceTitle: 'Memory Workspaces',
+        memoryCapabilitiesTitle: 'Memory Capabilities',
+        memoryStorageTitle: 'Central Memory & Storage',
+        memoryAutomationTitle: 'Memory Automation',
+        memoryImpactTitle: 'Memory Impact from self-improve / involve',
+        memoryRecentTitle: 'Recent Memory Files',
+        loading: 'Loading…',
+        noData: 'No data',
+        noTasks: 'No jobs',
+        autoRefresh: 'Auto-refreshed status',
+        runningNow: 'Running',
+        idle: 'Idle',
+        on: 'On',
+        off: 'Off',
+        yes: 'Yes',
+        save: 'Save',
+        cancel: 'Cancel',
+        switchModel: 'Switch Model',
+        currentModel: 'Current model',
+        chooseModel: 'Choose a model',
+        saving: 'Saving...',
+        saveFailed: 'Save failed',
+        noValidModels: 'No valid models are available.',
+        schedule: 'Schedule',
+        enabled: 'Enabled',
+        running: 'Running',
+        lastStatus: 'Last Status',
+        lastDuration: 'Last Duration',
+        nextRun: 'Next Run',
+        task: 'Job',
+        agent: 'Agent',
+        model: 'Current Model',
+        switchModelBtn: 'Switch Model',
+        workspace: 'Workspace',
+        entries: 'Entries',
+        todayAdded: 'Today',
+        latestFile: 'Latest File',
+        updatedAt: 'Updated',
+        file: 'File',
+        size: 'Size',
+        capabilitySource: 'Source',
+        capabilityStatus: 'Status',
+        automationEffect: 'Effect',
+        countdownSuffix: 'to refresh',
+        overdue: 'now',
+      }},
+    }};
+    let currentLang = localStorage.getItem(LANG_KEY) || 'zh';
+    if (!I18N[currentLang]) currentLang = 'zh';
+
+    function t(key) {{
+      return (I18N[currentLang] && I18N[currentLang][key]) || (I18N.zh && I18N.zh[key]) || key;
+    }}
+
+    function setLang(lang) {{
+      currentLang = I18N[lang] ? lang : 'zh';
+      localStorage.setItem(LANG_KEY, currentLang);
+      document.documentElement.lang = currentLang === 'en' ? 'en' : 'zh-CN';
+      document.title = t('title');
+      document.querySelectorAll('[data-i18n]').forEach((el) => {{
+        const key = el.getAttribute('data-i18n');
+        if (key) el.textContent = t(key);
+      }});
+      document.querySelectorAll('.lang-btn').forEach((btn) => {{
+        btn.classList.toggle('active', btn.getAttribute('data-lang') === currentLang);
+      }});
+      const cancelBtn = $('#model-switch-cancel');
+      const saveBtn = $('#model-switch-save');
+      if (cancelBtn) cancelBtn.textContent = t('cancel');
+      if (saveBtn) saveBtn.textContent = t('save');
+      paintCountdown();
+      render(dashboardState);
+    }}
+
+    function fmtRelative(ms) {{
+      const delta = Number(ms || 0) - Date.now();
+      if (!Number.isFinite(delta) || !ms) return '-';
+      if (delta <= 0) return t('overdue');
+      const sec = Math.floor(delta / 1000);
+      if (sec < 60) return `${{sec}}s`;
+      const min = Math.floor(sec / 60);
+      const remSec = sec % 60;
+      if (min < 60) return `${{min}}m${{remSec}}s`;
+      const hour = Math.floor(min / 60);
+      const remMin = min % 60;
+      if (hour < 24) return `${{hour}}h${{remMin}}m`;
+      const day = Math.floor(hour / 24);
+      const remHour = hour % 24;
+      return `${{day}}d${{remHour}}h`;
+    }}
+
+    function statusText(status, tone) {{
+      return `<span class="${{tone || 'muted'}}">${{escapeHtml(status || '-')}}</span>`;
+    }}
+
+    const modalController = {{
+      show() {{
+        const modalEl = document.getElementById('model-switch-modal');
+        if (!modalEl) return;
+        modalEl.classList.add('open');
+        document.body.classList.add('modal-open');
+      }},
+      hide() {{
+        const modalEl = document.getElementById('model-switch-modal');
+        if (!modalEl) return;
+        modalEl.classList.remove('open');
+        document.body.classList.remove('modal-open');
+        const statusEl = $('#model-switch-status');
+        if (statusEl) statusEl.textContent = '';
+      }},
     }};
 
     function stateBadge(v) {{
@@ -2732,11 +3149,11 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const ov = d.overview || {{}};
       const o = d.openclaw || {{}};
       const cards = [
-        ['OpenClaw', o.state || '-', '状态自动刷新'],
-        ['Agents', ov.agentCount, `运行中 ${{fmtNum(ov.runningAgents)}}`],
-        ['Sub-Agents', ov.subagentCount, `运行中 ${{fmtNum(ov.runningSubagents)}}`],
-        ['Crons', ov.cronCount, `运行中 ${{fmtNum(ov.runningCrons)}}`],
-        ['Models', ov.modelCount, `总 Tokens ${{fmtNum(ov.tokens)}}`],
+        ['OpenClaw', o.state || '-', t('autoRefresh')],
+        ['Agents', ov.agentCount, `${{t('runningNow')}} ${{fmtNum(ov.runningAgents)}}`],
+        ['Sub-Agents', ov.subagentCount, `${{t('runningNow')}} ${{fmtNum(ov.runningSubagents)}}`],
+        ['Crons', ov.cronCount, `${{t('runningNow')}} ${{fmtNum(ov.runningCrons)}}`],
+        ['Models', ov.modelCount, `Tokens ${{fmtNum(ov.tokens)}}`],
       ];
       $('#cards').innerHTML = cards.map(([k,v,s]) => `
         <div class="card">
@@ -2751,38 +3168,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       $('#agents-body').innerHTML = agents.map(a => `
         <tr>
           <td>${{a.id}}</td>
-          <td>${{stateBadge(a.running)}} ${{a.running ? 'running' : 'idle'}}</td>
+          <td>${{stateBadge(a.running)}} ${{a.running ? t('runningNow') : t('idle')}}</td>
           <td>${{a.subagentsRunning}} / ${{a.subagentsTotal}}</td>
           <td>${{fmtNum(a.sessionsCount)}}</td>
-          <td>${{a.heartbeatEnabled ? 'on (' + (a.heartbeatEvery || '-') + ')' : 'off'}}</td>
+          <td>${{a.heartbeatEnabled ? (t('on') + ' (' + (a.heartbeatEvery || '-') + ')') : t('off')}}</td>
           <td>${{escapeHtml(a.currentModel || '-')}}</td>
           <td class="model-cell">${{renderModelSwitchButton('agent', a.id, a.currentModel, agentModels)}}</td>
         </tr>
-      `).join('') || '<tr><td colspan="7" class="meta">暂无数据</td></tr>';
+      `).join('') || '<tr><td colspan="7" class="meta">' + t('noData') + '</td></tr>';
       bindModelSwitchButtons('agent');
 
-
-      const crons = (d.crons || {{}}).jobs || [];
-      const cronModels = (d.crons || {{}}).availableModels || [];
-      cronMap.clear();
-      crons.forEach(c => cronMap.set(c.id, c));
-
-      const cronsBody = $('#crons-body');
-      cronsBody.innerHTML = crons.map(c => `
-        <tr>
-          <td>${{c.name}}</td>
-          <td>${{c.agentId}}</td>
-          <td>${{escapeHtml(c.scheduleText || '-')}}</td>
-          <td>${{c.enabled ? '<span class="ok">yes</span>' : '<span class="warn">no</span>'}}</td>
-          <td>${{c.running ? '<span class="ok">running</span>' : '-'}}</td>
-          <td>${{escapeHtml(c.currentModel || '-')}}</td>
-          <td>${{c.lastStatus || '-'}}</td>
-          <td>${{c.lastDurationMs ? Math.round(c.lastDurationMs/1000)+'s' : '-'}}</td>
-          <td>${{fmtTime(c.nextRunAtMs)}}</td>
-          <td class="model-cell">${{renderModelSwitchButton('cron', c.id, c.currentModel, cronModels)}}</td>
-        </tr>
-      `).join('') || '<tr><td colspan="10" class="meta">暂无数据</td></tr>';
-      bindModelSwitchButtons('cron');
+      renderCronTable(d.crons || {{}});
 
       const daily = (d.models || {{}}).dailyTokens || [];
       renderDailyChart(daily);
@@ -2791,7 +3187,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const models = (modelsData.models || []).filter(m => Number(m.tokens || 0) > 0);
       const metaEl = $('#token-consumption-meta');
       if (metaEl) {{
-        metaEl.textContent = `${{modelsData.formula || '实际消耗 Token = 净输入 + 输出；净输入 = max(0, 输入 - 缓存复用)'}}｜主动 ${{fmtNum(modelsData.activeTokens || 0)}}（${{fmtNum(modelsData.activeSessions || 0)}} sessions）｜被动 ${{fmtNum(modelsData.passiveTokens || 0)}}（${{fmtNum(modelsData.passiveSessions || 0)}} sessions）`;
+        metaEl.textContent = `${{modelsData.formula || '实际消耗 Token = 净输入 + 输出；净输入 = max(0, 输入 - 缓存复用)'}}｜${{t('runningNow')}} ${{fmtNum(modelsData.activeTokens || 0)}}（${{fmtNum(modelsData.activeSessions || 0)}} sessions）｜Passive ${{fmtNum(modelsData.passiveTokens || 0)}}（${{fmtNum(modelsData.passiveSessions || 0)}} sessions）`;
       }}
 
       $('#models-body').innerHTML = models.map(m => `
@@ -2806,9 +3202,52 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{fmtNum(m.outputTokens)}}</td>
           <td>${{fmtNum(m.cacheRead)}} / ${{fmtNum(m.cacheWrite)}}</td>
         </tr>
-      `).join('') || '<tr><td colspan="9" class="meta">暂无数据</td></tr>';
+      `).join('') || '<tr><td colspan="9" class="meta">' + t('noData') + '</td></tr>';
 
       renderMemory(d.memory || {{}});
+      paintRelativeTimes();
+    }}
+
+    function renderCronTable(data) {{
+      const crons = (data || {{}}).jobs || [];
+      const cronModels = (data || {{}}).availableModels || [];
+      const hasAgentAssociation = !!((data || {{}}).hasAgentAssociation);
+      cronMap.clear();
+      crons.forEach(c => cronMap.set(c.id, c));
+
+      const head = $('#crons-head');
+      if (head) {{
+        head.innerHTML = `
+          <tr>
+            <th>${{t('task')}}</th>
+            ${{hasAgentAssociation ? `<th>${{t('agent')}}</th>` : ''}}
+            <th>${{t('schedule')}}</th>
+            <th>${{t('running')}}</th>
+            <th>${{t('model')}}</th>
+            <th>${{t('lastStatus')}}</th>
+            <th>${{t('lastDuration')}}</th>
+            <th>${{t('nextRun')}}</th>
+            <th>${{t('switchModelBtn')}}</th>
+          </tr>
+        `;
+      }}
+
+      const cronsBody = $('#crons-body');
+      const colspan = hasAgentAssociation ? 9 : 8;
+      cronsBody.innerHTML = crons.map(c => `
+        <tr>
+          <td>${{escapeHtml(c.name || c.id || '-')}}</td>
+          ${{hasAgentAssociation ? `<td>${{escapeHtml(c.agentId || '-')}}</td>` : ''}}
+          <td>${{escapeHtml(c.scheduleText || '-')}}</td>
+          <td>${{c.running ? `<span class="ok">${{t('runningNow')}}</span>` : '<span class="muted">-</span>'}}</td>
+          <td>${{escapeHtml(c.currentModel || '-')}}</td>
+          <td>${{statusText(c.lastStatus || '-', c.lastStatusTone)}}</td>
+          <td>${{c.lastDurationMs ? Math.round(c.lastDurationMs/1000)+'s' : '-'}}</td>
+          <td class="next-run" data-next-run-ms="${{c.nextRunAtMs || ''}}">${{fmtRelative(c.nextRunAtMs)}}</td>
+          <td class="model-cell">${{renderModelSwitchButton('cron', c.id, c.currentModel, cronModels)}}</td>
+        </tr>
+      `).join('') || `<tr><td colspan="${{colspan}}" class="meta">${{t('noTasks')}}</td></tr>`;
+      bindModelSwitchButtons('cron');
     }}
 
     function renderCronMonitorList(crons) {{
@@ -2872,7 +3311,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     function renderModelSwitchButton(kind, entityId, currentModel, models) {{
       const encodedModels = encodeURIComponent(JSON.stringify(Array.isArray(models) ? models : []));
-      return `<button class="btn-monitor btn-model-switch" data-kind="${{escapeHtml(kind)}}" data-id="${{escapeHtml(entityId)}}" data-current-model="${{escapeHtml(currentModel || '')}}" data-models="${{encodedModels}}">切换模型</button>`;
+      return `<button class="btn-monitor btn-model-switch" data-kind="${{escapeHtml(kind)}}" data-id="${{escapeHtml(entityId)}}" data-current-model="${{escapeHtml(currentModel || '')}}" data-models="${{encodedModels}}">${{t('switchModelBtn')}}</button>`;
     }}
 
     function openModelSwitchModal(kind, entityId, currentModel, models) {{
@@ -2895,13 +3334,13 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       modelModalState.currentModel = String(currentModel || '').trim();
       modelModalState.models = validModels;
 
-      if (titleEl) titleEl.textContent = `切换模型 · ${{kind === 'agent' ? 'Agent' : 'Cron'}}`;
-      if (currentEl) currentEl.textContent = `当前模型：${{modelModalState.currentModel || '-'}}`;
+      if (titleEl) titleEl.textContent = `${{t('switchModel')}} · ${{kind === 'agent' ? 'Agent' : 'Cron'}}`;
+      if (currentEl) currentEl.textContent = `${{t('currentModel')}}：${{modelModalState.currentModel || '-'}}`;
       if (statusEl) statusEl.textContent = '';
 
       if (optionsEl) {{
         if (!validModels.length) {{
-          optionsEl.innerHTML = '<div class="meta">当前没有可切换的有效模型。</div>';
+          optionsEl.innerHTML = `<div class="meta">${{t('noValidModels')}}</div>`;
         }} else {{
           optionsEl.innerHTML = validModels.map((row, idx) => {{
             const id = String((row && row.id) || '').trim();
@@ -2928,9 +3367,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         }}
       }}
 
-      const modalEl = document.getElementById('model-switch-modal');
-      if (!modalEl) return;
-      bootstrap.Modal.getOrCreateInstance(modalEl).show();
+      modalController.show();
     }}
 
     function bindModelSwitchButtons(kind) {{
@@ -2957,41 +3394,44 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const optionsEl = $('#model-switch-options');
       if (!modalEl || !saveBtn || !statusEl || !optionsEl) return;
 
-      modalEl.addEventListener('hidden.bs.modal', () => {{
-        statusEl.textContent = '';
+      modalEl.querySelectorAll('[data-modal-close="true"]').forEach((el) => {{
+        el.addEventListener('click', () => modalController.hide());
+      }});
+      document.addEventListener('keydown', (e) => {{
+        if (e.key === 'Escape' && modalEl.classList.contains('open')) modalController.hide();
       }});
 
       saveBtn.onclick = async () => {{
         const selected = optionsEl.querySelector('input[name="model-switch-option"]:checked');
         if (!selected) {{
-          statusEl.textContent = '请选择模型';
+          statusEl.textContent = t('chooseModel');
           return;
         }}
 
         const model = String(selected.value || '').trim();
         if (!model) {{
-          statusEl.textContent = '请选择模型';
+          statusEl.textContent = t('chooseModel');
           return;
         }}
 
         const headers = {{}};
         if (token()) headers['Authorization'] = 'Bearer ' + token();
         saveBtn.disabled = true;
-        statusEl.textContent = '保存中...';
+        statusEl.textContent = t('saving');
 
         try {{
           const url = modelModalState.kind === 'agent'
             ? `/api/agents/${{encodeURIComponent(modelModalState.entityId)}}/model`
             : `/api/crons/${{encodeURIComponent(modelModalState.entityId)}}/model`;
           await postJson(url, {{ model }}, headers);
-          bootstrap.Modal.getOrCreateInstance(modalEl).hide();
+          modalController.hide();
           if (modelModalState.kind === 'agent') {{
             refreshOne('agents', true);
           }} else {{
             refreshOne('crons', true);
           }}
         }} catch (e) {{
-          statusEl.textContent = '保存失败: ' + (e.message || e);
+          statusEl.textContent = `${{t('saveFailed')}}: ` + (e.message || e);
           console.warn('model switch failed', e);
         }} finally {{
           saveBtn.disabled = false;
@@ -3011,12 +3451,13 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const s = m.summary || {{}};
       const c = m.central || {{}};
       const st = m.storage || {{}};
+      const capabilities = m.capabilities || [];
 
       const cards = [
-        ['工作区', s.workspaceCount || 0, `总条目 ${{fmtNum(s.totalEntries || 0)}}`],
-        ['今日新增', s.todayEntries || 0, `最近文件 ${{fmtNum(s.recentCount || 0)}}`],
-        ['中央记忆主题', c.topicsCount || 0, `memories-md ${{fmtNum(c.memoriesMdCount || 0)}}`],
-        ['向量存储', st.sqliteCount || 0, `SQLite ${{fmtBytes(st.sqliteBytes || 0)}}`],
+        [currentLang === 'en' ? 'Workspaces' : '工作区', s.workspaceCount || 0, `${{currentLang === 'en' ? 'Entries' : '总条目'}} ${{fmtNum(s.totalEntries || 0)}}`],
+        [currentLang === 'en' ? 'Today' : '今日新增', s.todayEntries || 0, `${{currentLang === 'en' ? 'Recent files' : '最近文件'}} ${{fmtNum(s.recentCount || 0)}}`],
+        [currentLang === 'en' ? 'Central topics' : '中央记忆主题', c.topicsCount || 0, `memories-md ${{fmtNum(c.memoriesMdCount || 0)}}`],
+        [currentLang === 'en' ? 'Capabilities' : '能力数', capabilities.length || 0, `${{currentLang === 'en' ? 'SQLite' : 'SQLite'}} ${{fmtBytes(st.sqliteBytes || 0)}}`],
       ];
       const cardsEl = $('#memory-cards');
       if (cardsEl) {{
@@ -3038,7 +3479,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{w.latestFile || '-'}}</td>
           <td>${{fmtTime(w.latestAt)}}</td>
         </tr>
-      `).join('') || '<tr><td colspan="5" class="meta">暂无数据</td></tr>';
+      `).join('') || '<tr><td colspan="5" class="meta">' + t('noData') + '</td></tr>';
 
       const recRows = m.recent || [];
       $('#memory-recent-body').innerHTML = recRows.map(r => `
@@ -3048,22 +3489,23 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{fmtBytes(r.size)}}</td>
           <td>${{fmtTime(r.updatedAt)}}</td>
         </tr>
-      `).join('') || '<tr><td colspan="4" class="meta">暂无数据</td></tr>';
+      `).join('') || '<tr><td colspan="4" class="meta">' + t('noData') + '</td></tr>';
 
-      const p = m.plugin || {{}};
-      const pDescEl = $('#memory-plugin-desc');
-      if (pDescEl) {{
-        const details = [
-          ['插件 ID', p.id || '-'],
-          ['别名', p.alias || '-'],
-          ['状态', p.enabled ? 'enabled' : 'disabled'],
-        ];
-        pDescEl.innerHTML = `
+      const capEl = $('#memory-capabilities');
+      if (capEl) {{
+        capEl.innerHTML = capabilities.map((cap) => `
           <div class="memory-list-item">
-            ${{details.map(([k, v]) => `<div class="kv-row"><div class="kv-key">${{escapeHtml(k)}}</div><div class="kv-value">${{escapeHtml(v)}}</div></div>`).join('')}}
+            <div class="memory-cap-head">
+              <div class="memory-cap-title">${{escapeHtml(cap.title || cap.id || '-')}}</div>
+              <span class="status-chip ${{escapeHtml(cap.status || 'muted')}}">${{escapeHtml(cap.status || '-')}}</span>
+            </div>
+            <div class="meta">${{escapeHtml(cap.detail || '')}}</div>
+            <div class="kv-list">
+              <div class="kv-row"><div class="kv-key">${{t('capabilitySource')}}</div><div class="kv-value">${{escapeHtml(cap.source || '-')}}</div></div>
+              ${{Array.isArray(cap.evidence) && cap.evidence.length ? `<div class="kv-row"><div class="kv-key">Evidence</div><div class="kv-value">${{escapeHtml(cap.evidence[0])}}</div></div>` : ''}}
+            </div>
           </div>
-          ${{(p.description || []).map((x) => `<div class="memory-list-item">${{escapeHtml(x)}}</div>`).join('')}}
-        `;
+        `).join('') || `<div class="meta">${{t('noData')}}</div>`;
       }}
 
       const storageEl = $('#memory-storage-summary');
@@ -3073,10 +3515,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         const rows = [
           ['central topics', fmtNum(central.topicsCount || 0)],
           ['memories-md', fmtNum(central.memoriesMdCount || 0)],
-          ['最新 topic 更新时间', fmtTime(central.latestTopicAt)],
-          ['MEMORY.md', central.hasMemoryMd ? '已存在' : '未发现'],
-          ['SQLite 文件', `${{fmtNum(storage.sqliteCount || 0)}} · ${{fmtBytes(storage.sqliteBytes || 0)}}`],
-          ['LanceDB 体积', fmtBytes(storage.lancedbBytes || 0)],
+          [currentLang === 'en' ? 'Latest topic' : '最新 topic 更新时间', fmtTime(central.latestTopicAt)],
+          ['MEMORY.md', central.hasMemoryMd ? (currentLang === 'en' ? 'Found' : '已存在') : (currentLang === 'en' ? 'Missing' : '未发现')],
+          [currentLang === 'en' ? 'SQLite files' : 'SQLite 文件', `${{fmtNum(storage.sqliteCount || 0)}} · ${{fmtBytes(storage.sqliteBytes || 0)}}`],
+          ['LanceDB', fmtBytes(storage.lancedbBytes || 0)],
           ['backups', fmtNum(storage.backupCount || 0)],
         ];
         storageEl.innerHTML = rows.map(([k, v]) => `
@@ -3085,6 +3527,27 @@ def _index_html(auth_token: Optional[str] = None) -> str:
             <div class="kv-value">${{escapeHtml(v)}}</div>
           </div>
         `).join('');
+      }}
+
+      const autoEl = $('#memory-automation');
+      if (autoEl) {{
+        const rows = m.automations || [];
+        autoEl.innerHTML = rows.map((it) => `
+          <div class="memory-list-item">
+            <strong>${{escapeHtml(it.name || '-')}}</strong>
+            <div class="meta">${{escapeHtml(it.effect || '')}}</div>
+            <div class="kv-row">
+              <div class="kv-key">${{t('schedule')}}</div>
+              <div class="kv-value">${{escapeHtml(it.scheduleText || '-')}}</div>
+            </div>
+            <div class="kv-row">
+              <div class="kv-key">${{t('lastStatus')}}</div>
+              <div class="kv-value ${{
+                escapeHtml(it.lastStatusTone || 'muted')
+              }}">${{escapeHtml(it.lastStatus || '-')}}</div>
+            </div>
+          </div>
+        `).join('') || `<div class="meta">${{t('noData')}}</div>`;
       }}
 
       const impacts = m.impacts || {{}};
@@ -3098,16 +3561,16 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           return `
             <div class="memory-list-item">
               <strong>${{escapeHtml(title)}}</strong>
-              <div class="meta">影响任务数：${{fmtNum(group.count || 0)}}</div>
+              <div class="meta">${{currentLang === 'en' ? 'Related jobs' : '影响任务数'}}：${{fmtNum(group.count || 0)}}</div>
               ${{items.length ? items.map((it) => `
                 <div class="kv-row">
                   <div>
                     <div>${{escapeHtml(it.name || '-')}}</div>
                     <div class="meta">${{escapeHtml(it.effect || '')}}</div>
                   </div>
-                  <div class="kv-value">${{it.enabled ? 'enabled' : 'disabled'}}<br>${{escapeHtml(it.lastStatus || '-')}}</div>
+                  <div class="kv-value">${{it.enabled ? t('yes') : 'no'}}<br><span class="${{escapeHtml(it.lastStatusTone || 'muted')}}">${{escapeHtml(it.lastStatus || '-')}}</span></div>
                 </div>
-              `).join('') : '<div class="meta">未发现关联任务</div>'}}
+              `).join('') : `<div class="meta">${{t('noData')}}</div>`}}
             </div>
           `;
         }}
@@ -3124,9 +3587,9 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const metaEl = $('#daily-token-meta');
       if (!el) return;
       if (!rows || !rows.length) {{
-        if (metaEl) metaEl.textContent = '暂无数据';
+        if (metaEl) metaEl.textContent = t('noData');
         el.className = 'meta';
-        el.textContent = '暂无数据';
+        el.textContent = t('noData');
         return;
       }}
 
@@ -3202,6 +3665,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       setActivePage(page, {{ forceRefresh: true, replaceUrl: true }});
     }});
 
+    document.querySelectorAll('.lang-btn').forEach((btn) => {{
+      btn.addEventListener('click', () => setLang(btn.getAttribute('data-lang') || 'zh'));
+    }});
+
+    function paintRelativeTimes() {{
+      document.querySelectorAll('[data-next-run-ms]').forEach((el) => {{
+        const raw = el.getAttribute('data-next-run-ms');
+        el.textContent = fmtRelative(raw ? Number(raw) : 0);
+      }});
+    }}
+
     function paintCountdown() {{
       const map = {{
         '#cd-agents': (refreshState.agents && refreshState.agents.remain != null) ? refreshState.agents.remain : 0,
@@ -3211,10 +3685,11 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       }};
       Object.entries(map).forEach(([sel, sec]) => {{
         const el = $(sel);
-        if (el) el.textContent = `${{sec}}秒后刷新`;
+        if (el) el.textContent = currentLang === 'en' ? `${{sec}}s ${{t('countdownSuffix')}}` : `${{sec}}秒${{t('countdownSuffix')}}`;
       }});
     }}
 
+    setLang(currentLang);
     paintCountdown();
     bootstrapRefresh();
     bindModelSwitchModal();
@@ -3236,6 +3711,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       }});
 
       paintCountdown();
+      paintRelativeTimes();
     }}, 1000);
   </script>
 </body>
