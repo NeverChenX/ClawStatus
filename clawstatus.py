@@ -3435,7 +3435,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       deleting: 'Deleting...',
       deleted: 'Deleted',
       deleteFailed: 'Delete failed',
-      confirmDelete: 'Are you sure you want to delete this job?'}}
+      confirmDelete: 'Are you sure you want to delete this job?',
       workspace: 'Workspace',
       entries: 'Entries',
       todayAdded: 'Today',
