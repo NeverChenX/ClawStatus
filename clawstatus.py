@@ -2481,9 +2481,13 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
     )
 
     # 3 states: Online / Restarting / Offline
+    # TCP probe is real-time; service_running may come from stale cache.
+    # When TCP probe explicitly says unreachable, don't trust cached service_running.
     if any(sig in runtime_lc for sig in restarting_signals):
         state = "Restarting"
-    elif service_running or gateway_reachable or tcp_reachable:
+    elif tcp_reachable or gateway_reachable:
+        state = "Online"
+    elif service_running and tcp_reachable is not False:
         state = "Online"
     else:
         state = "Offline"
