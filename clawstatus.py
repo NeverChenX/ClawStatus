@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import mmap
 import os
 import signal
 import subprocess
@@ -23,7 +24,7 @@ import time
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from flask import Flask, jsonify, request, Response
 
@@ -32,7 +33,7 @@ try:
 except Exception:  # pragma: no cover
     waitress_serve = None
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 APP_TITLE = "ClawStatus"
 
 HOME = Path.home()
@@ -47,8 +48,13 @@ RUNTIME_DIR = HOME / ".clawstatus"
 PID_FILE = RUNTIME_DIR / "clawstatus.pid"
 LOG_FILE = RUNTIME_DIR / "clawstatus.log"
 
-ACTIVE_AGENT_WINDOW_MS = 5 * 60 * 1000
+ACTIVE_AGENT_WINDOW_MS = 30 * 1000  # 30秒窗口，更敏感地检测停止
 _REFRESH_INTERVAL_SEC = 30
+
+# Agent 实时检测缓存（极致轻量）
+_agent_fs_cache: Dict[str, Tuple[float, bool, Optional[int]]] = {}
+_agent_fs_cache_lock = threading.Lock()
+_agent_fs_cache_ttl_sec = 1  # 1秒缓存，极速响应
 _STATUS_CACHE_TTL_SEC = 60
 _STATUS_WARMUP_INTERVAL_SEC = 120
 _STATUS_WARMUP_IDLE_GRACE_SEC = 600
@@ -58,6 +64,11 @@ _DAILY_FILELIST_TTL_SEC = 900
 _MODELS_CACHE_TTL_SEC = 300
 _MEMORY_CACHE_TTL_SEC = 300
 _status_cache: Dict[str, Any] = {"ts": 0.0, "data": None, "err": None}
+
+# TCP 端口探测配置（极简，1-3ms 完成）
+_TCP_PROBE_TIMEOUT_SEC = 0.5  # TCP 连接超时（秒）
+_tcp_probe_cache: Dict[str, Any] = {"ts": 0.0, "reachable": False, "latency_ms": None}
+_tcp_probe_lock = threading.Lock()
 _dash_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 _daily_tokens_cache: Dict[str, Any] = {
     "ts": 0.0,
@@ -335,6 +346,54 @@ def _load_auth_token() -> Optional[str]:
     return token or None
 
 
+def _tcp_probe_openclaw() -> Tuple[bool, Optional[int]]:
+    """
+    TCP 端口探测 OpenClaw 是否存活。
+    极简实现：1-3ms 完成，无子进程，无 HTTP 开销。
+    返回: (是否可达, 延迟毫秒)
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(_TCP_PROBE_TIMEOUT_SEC)
+        start = time.time()
+        result = sock.connect_ex(('127.0.0.1', 8080))
+        latency_ms = int((time.time() - start) * 1000)
+        sock.close()
+        return result == 0, latency_ms
+    except Exception:
+        return False, None
+
+
+def _refresh_tcp_probe() -> Dict[str, Any]:
+    """执行 TCP 探测并更新缓存。"""
+    reachable, latency_ms = _tcp_probe_openclaw()
+    
+    result = {
+        "ts": time.time(),
+        "reachable": reachable,
+        "latencyMs": latency_ms,
+    }
+    
+    with _tcp_probe_lock:
+        _tcp_probe_cache.update(result)
+    
+    return result
+
+
+def _get_tcp_probe_status() -> Dict[str, Any]:
+    """获取 TCP 探测状态（优先缓存，必要时刷新）。"""
+    with _tcp_probe_lock:
+        cached = dict(_tcp_probe_cache)
+    
+    now = time.time()
+    # 缓存有效直接返回
+    if now - cached.get("ts", 0) < _TCP_PROBE_CACHE_TTL_SEC:
+        return cached
+    
+    # 缓存过期，执行探测
+    return _refresh_tcp_probe()
+
+
 def _token_from_request() -> Optional[str]:
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
@@ -360,16 +419,166 @@ def _require_auth(required_token: Optional[str]):
 
 
 def _read_last_jsonl_obj(path: Path) -> Optional[Dict[str, Any]]:
+    """mmap 快速读取最后 4KB，避免加载整个大文件"""
     if not path.exists() or not path.is_file():
         return None
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-        if not lines:
-            return None
-        return json.loads(lines[-1])
+        with open(path, "rb") as f:
+            # 尝试用 mmap 读取
+            try:
+                size = os.fstat(f.fileno()).st_size
+                if size == 0:
+                    return None
+                # 大文件只读最后 4KB
+                if size > 4096:
+                    f.seek(size - 4096)
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    # 找到最后一行
+                    data = mm.read()
+                    lines = data.decode("utf-8", errors="replace").strip().splitlines()
+                    if not lines:
+                        return None
+                    return json.loads(lines[-1])
+            except Exception:
+                # mmap 失败回退到普通读取
+                f.seek(0)
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+                return json.loads(lines[-1]) if lines else None
     except Exception:
         return None
+
+
+# inotify 实时监控配置
+_WATCHED_FILES: Dict[str, str] = {
+    str(CRON_JOBS_PATH): "crons",
+    str(SUBAGENT_RUNS_PATH): "subagents",
+    str(OPENCLAW_CONFIG): "config",
+}
+_inotify_initialized = False
+_inotify_watches: Dict[str, int] = {}
+_inotify_fd: Optional[int] = None
+
+
+def _init_inotify() -> bool:
+    """初始化 inotify 监控（仅 Linux）"""
+    global _inotify_initialized, _inotify_fd
+    if _inotify_initialized:
+        return _inotify_fd is not None
+    
+    _inotify_initialized = True
+    
+    # 检查是否支持 inotify
+    try:
+        import ctypes
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        
+        # inotify_init1 标志
+        IN_CLOEXEC = 0x80000
+        IN_NONBLOCK = 0x800
+        
+        fd = libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        if fd < 0:
+            return False
+        
+        _inotify_fd = fd
+        
+        # 监控文件修改（IN_MODIFY = 0x00000002）
+        IN_MODIFY = 0x00000002
+        
+        for filepath, name in _WATCHED_FILES.items():
+            if os.path.exists(filepath):
+                wd = libc.inotify_add_watch(_inotify_fd, filepath.encode(), IN_MODIFY)
+                if wd >= 0:
+                    _inotify_watches[wd] = name
+        
+        return len(_inotify_watches) > 0
+    except Exception:
+        return False
+
+
+def _check_inotify_events(timeout_sec: float = 0.0) -> Set[str]:
+    """检查文件变化事件，非阻塞"""
+    if _inotify_fd is None:
+        return set()
+    
+    changed: Set[str] = set()
+    
+    try:
+        import ctypes
+        import select
+        
+        # 非阻塞检查是否有事件
+        readable, _, _ = select.select([_inotify_fd], [], [], timeout_sec)
+        if not readable:
+            return changed
+        
+        # 读取事件（inotify_event 结构）
+        buf = os.read(_inotify_fd, 4096)
+        offset = 0
+        
+        while offset < len(buf):
+            # struct inotify_event { int wd; uint32_t mask; uint32_t cookie; uint32_t len; char name[]; }
+            if offset + 16 > len(buf):
+                break
+            
+            wd = int.from_bytes(buf[offset:offset+4], 'little', signed=True)
+            # mask = int.from_bytes(buf[offset+4:offset+8], 'little')
+            # cookie = int.from_bytes(buf[offset+8:offset+12], 'little')
+            name_len = int.from_bytes(buf[offset+12:offset+16], 'little')
+            
+            if wd in _inotify_watches:
+                changed.add(_inotify_watches[wd])
+            
+            offset += 16 + name_len
+    except Exception:
+        pass
+    
+    return changed
+
+
+def _invalidate_cache_by_type(cache_type: str) -> None:
+    """根据变化类型使缓存失效"""
+    global _dash_cache, _status_cache, _models_cache, _memory_cache
+    
+    now = time.time()
+    
+    if cache_type == "crons":
+        # Cron 变化只刷新 dashboard
+        with _dash_lock:
+            _dash_cache["ts"] = 0
+    elif cache_type == "subagents":
+        # Subagent 变化刷新 dashboard
+        with _dash_lock:
+            _dash_cache["ts"] = 0
+    elif cache_type == "config":
+        # 配置变化影响所有
+        with _dash_lock:
+            _dash_cache["ts"] = 0
+        with _status_lock:
+            _status_cache["ts"] = 0
+        with _models_lock:
+            _models_cache["ts"] = 0
+        with _memory_lock:
+            _memory_cache["ts"] = 0
+
+
+def _start_inotify_monitor() -> None:
+    """启动 inotify 监控线程（事件驱动，零轮询）"""
+    if not _init_inotify():
+        return  # 不支持 inotify，静默回退到轮询
+    
+    def _monitor_loop():
+        while True:
+            try:
+                # 等待事件（阻塞，但零 CPU）
+                changed = _check_inotify_events(timeout_sec=1.0)
+                for cache_type in changed:
+                    _invalidate_cache_by_type(cache_type)
+            except Exception:
+                time.sleep(1)
+    
+    t = threading.Thread(target=_monitor_loop, daemon=True, name="clawstatus-inotify")
+    t.start()
 
 
 def _collect_subagent_runs() -> Dict[str, Any]:
@@ -668,6 +877,36 @@ def _trigger_cron_run(job_id: str) -> Dict[str, Any]:
         return {"jobId": job_id, "triggered": True}
     except Exception as e:
         return {"jobId": job_id, "triggered": False, "error": str(e)}
+
+
+def _delete_cron_job(job_id: str) -> Dict[str, Any]:
+    """Delete a cron job via `openclaw cron delete <id>`."""
+    jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
+    jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
+    found = any(
+        isinstance(j, dict) and str(j.get("id") or "") == job_id
+        for j in jobs
+    )
+    if not found:
+        raise KeyError(job_id)
+    
+    openclaw_bin = (
+        os.environ.get("OPENCLAW_BIN")
+        or shutil.which("openclaw")
+        or str(HOME / ".npm-global" / "bin" / "openclaw")
+    )
+    try:
+        proc = subprocess.run(
+            [openclaw_bin, "cron", "delete", job_id],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            raise OSError(proc.stderr.strip() or f"openclaw cron delete failed (rc={proc.returncode})")
+    except subprocess.TimeoutExpired:
+        raise OSError("openclaw cron delete timed out")
+    
+    _invalidate_dashboard_cache()
+    return {"jobId": job_id, "deleted": True}
 
 
 def _update_cron_model(job_id: str, model_id: str) -> Dict[str, Any]:
@@ -1452,11 +1691,16 @@ def _collect_memory_data(
 
     topic_files: List[Path] = []
     if topics_dir.exists():
+        # 限制扫描：最多50个文件
+        topic_count = 0
         for f in topics_dir.rglob("*.md"):
             if "_legacy_" in str(f):
                 continue
             if f.is_file():
                 topic_files.append(f)
+                topic_count += 1
+                if topic_count >= 50:  # 限制文件数
+                    break
 
     memories_md_files = [f for f in memories_md_dir.glob("*.md") if f.is_file()] if memories_md_dir.exists() else []
 
@@ -1484,10 +1728,15 @@ def _collect_memory_data(
     lancedb_size = 0
     lancedb_dir = memory_root / "lancedb-pro"
     if lancedb_dir.exists():
+        # 限制扫描：最多100个文件，避免大目录卡顿
+        file_count = 0
         for f in lancedb_dir.rglob("*"):
             if f.is_file():
                 try:
                     lancedb_size += int(f.stat().st_size)
+                    file_count += 1
+                    if file_count >= 100:  # 限制文件数
+                        break
                 except Exception:
                     pass
 
@@ -1867,6 +2116,46 @@ def _describe_schedule(schedule: Any) -> str:
     return kind or "-"
 
 
+# Cron run files 缓存
+_cron_run_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+_cron_run_cache_ttl_sec = 5  # 5秒缓存
+
+
+def _prefetch_cron_run_files(jobs: List[Dict[str, Any]]) -> None:
+    """预读取 cron run 文件，利用 mtime 避免重复读取未变更的文件"""
+    global _cron_run_cache
+    
+    now = time.time()
+    
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            continue
+        
+        run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
+        cache_key = str(run_file)
+        
+        # 检查缓存是否有效
+        cached = _cron_run_cache.get(cache_key)
+        if cached:
+            cached_time, _ = cached
+            if now - cached_time < _cron_run_cache_ttl_sec:
+                continue  # 缓存有效，跳过
+        
+        # 检查文件 mtime
+        try:
+            if run_file.exists():
+                mtime = run_file.stat().st_mtime
+                # 如果文件未变更，只更新时间戳
+                if cached and mtime <= cached_time:
+                    _cron_run_cache[cache_key] = (now, cached[1])
+                    continue
+        except Exception:
+            pass
+
+
 def _collect_cron_data() -> Dict[str, Any]:
     jobs_payload = _read_json_tolerant(CRON_JOBS_PATH, {"jobs": []})
     jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
@@ -1878,6 +2167,9 @@ def _collect_cron_data() -> Dict[str, Any]:
     total_jobs = 0
     agent_ids: List[str] = []
 
+    # 批量预读 run files（减少 IO 次数）
+    _prefetch_cron_run_files(jobs)
+    
     for job in jobs:
         if not isinstance(job, dict):
             continue
@@ -1887,9 +2179,7 @@ def _collect_cron_data() -> Dict[str, Any]:
             continue
         enabled_total += 1
         job_id = str(job.get("id") or "")
-        run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
-        last_event = _read_last_jsonl_obj(run_file)
-
+        
         state = job.get("state", {}) if isinstance(job.get("state"), dict) else {}
         last_status_raw = state.get("lastStatus") or state.get("lastRunStatus") or "-"
         last_status = str(last_status_raw or "").strip().lower()
@@ -1897,13 +2187,18 @@ def _collect_cron_data() -> Dict[str, Any]:
         active_status = {"running", "started", "processing", "in_progress", "pending", "queued"}
         terminal_status = {"completed", "complete", "success", "succeeded", "ok", "failed", "error", "cancelled", "canceled", "skipped", "timeout", "timed_out", "done"}
 
-        # 数据准确优先：先用 jobs.json 的状态作为主判据，run jsonl 只做补充
+        # 优先使用 jobs.json 中的状态，减少 jsonl 读取
         if last_status in active_status:
             is_running = True
+            last_event = None  # 不需要读 jsonl
         elif last_status in terminal_status:
             is_running = False
+            last_event = None  # 不需要读 jsonl
         else:
+            # 状态不明确时才读取 jsonl
             is_running = False
+            run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
+            last_event = _read_last_jsonl_obj(run_file)
             if isinstance(last_event, dict):
                 event_hint = str(last_event.get("action") or last_event.get("status") or "").lower()
                 if event_hint in active_status:
@@ -1986,6 +2281,57 @@ def _build_channels_from_status(status_data: Dict[str, Any]) -> List[Dict[str, A
     return channels
 
 
+def _check_agent_running_via_fs(agent_id: str) -> Tuple[bool, Optional[int]]:
+    """
+    极速检测 Agent 运行状态。
+    使用 os.scandir 直接读取目录，避免 glob 开销。
+    返回: (是否运行中, 最后活跃毫秒数)
+    """
+    global _agent_fs_cache
+    
+    now = time.time()
+    
+    # 检查缓存
+    with _agent_fs_cache_lock:
+        cached = _agent_fs_cache.get(agent_id)
+        if cached:
+            cached_time, cached_running, cached_age = cached
+            if now - cached_time < _agent_fs_cache_ttl_sec:
+                return cached_running, cached_age
+    
+    sessions_dir = AGENTS_DIR / agent_id / "sessions"
+    
+    try:
+        # 使用 os.scandir 极速扫描（比 glob 快 2-5 倍）
+        latest_mtime = 0.0
+        with os.scandir(sessions_dir) as it:
+            for entry in it:
+                if entry.name.endswith('.jsonl') and entry.is_file():
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if st.st_mtime > latest_mtime:
+                            latest_mtime = st.st_mtime
+                    except Exception:
+                        continue
+        
+        if latest_mtime == 0:
+            with _agent_fs_cache_lock:
+                _agent_fs_cache[agent_id] = (now, False, None)
+            return False, None
+        
+        age_ms = int((now - latest_mtime) * 1000)
+        is_running = age_ms <= ACTIVE_AGENT_WINDOW_MS
+        
+        with _agent_fs_cache_lock:
+            _agent_fs_cache[agent_id] = (now, is_running, age_ms)
+        
+        return is_running, age_ms
+    except Exception:
+        with _agent_fs_cache_lock:
+            _agent_fs_cache[agent_id] = (now, False, None)
+        return False, None
+
+
 def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any]) -> Dict[str, Any]:
     agents_block = status_data.get("agents", {}) if isinstance(status_data, dict) else {}
     heartbeat_block = status_data.get("heartbeat", {}) if isinstance(status_data, dict) else {}
@@ -2006,8 +2352,23 @@ def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any])
         if not isinstance(a, dict):
             continue
         aid = str(a.get("id") or "")
-        age_ms = a.get("lastActiveAgeMs")
-        agent_running = isinstance(age_ms, (int, float)) and age_ms <= ACTIVE_AGENT_WINDOW_MS
+        
+        # 优先使用文件系统实时检测（更快）
+        fs_running, fs_age_ms = _check_agent_running_via_fs(aid)
+        
+        # 也参考 status 数据（作为备份）
+        status_age_ms = a.get("lastActiveAgeMs")
+        
+        # 取更小的 age（更准确的活跃时间）
+        if fs_age_ms is not None and status_age_ms is not None:
+            effective_age_ms = min(fs_age_ms, status_age_ms)
+            agent_running = fs_running or (isinstance(status_age_ms, (int, float)) and status_age_ms <= ACTIVE_AGENT_WINDOW_MS)
+        elif fs_age_ms is not None:
+            effective_age_ms = fs_age_ms
+            agent_running = fs_running
+        else:
+            effective_age_ms = status_age_ms
+            agent_running = isinstance(status_age_ms, (int, float)) and status_age_ms <= ACTIVE_AGENT_WINDOW_MS
 
         own_subs = []
         for s in sub_runs:
@@ -2057,12 +2418,40 @@ def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any])
 
 
 def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err: Optional[str]) -> Dict[str, Any]:
+    """
+    汇总 OpenClaw 状态。
+    使用 TCP 端口探测（1-3ms）快速判断服务是否在线，再结合 openclaw status 的详细数据。
+    """
+    # TCP 端口探测（1-3ms 完成）
+    tcp_probe = _get_tcp_probe_status()
+    tcp_reachable = tcp_probe.get("reachable", False)
+    tcp_latency_ms = tcp_probe.get("latencyMs")
+    
+    # 如果没有状态数据，用 TCP 探测结果决定
     if not status_data:
+        if tcp_reachable:
+            return {
+                "ok": True,
+                "state": "Online",
+                "error": status_err,
+                "gateway": {
+                    "reachable": True,
+                    "latencyMs": tcp_latency_ms,
+                    "url": "127.0.0.1:8080",
+                    "service": "running",
+                },
+                "security": {},
+                "update": {},
+                "channels": [],
+            }
         return {
             "ok": False,
             "state": "Offline",
             "error": status_err or "Cannot reach OpenClaw",
-            "gateway": {},
+            "gateway": {
+                "reachable": False,
+                "url": "127.0.0.1:8080",
+            },
             "security": {},
             "update": {},
             "channels": [],
@@ -2076,7 +2465,12 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
     critical = int((security.get("summary") or {}).get("critical") or 0)
     warns = int((security.get("summary") or {}).get("warn") or 0)
 
-    gateway_reachable = bool(gateway.get("reachable", False))
+    # 优先使用 TCP 探测结果判断可达性（更快更准）
+    gateway_reachable = tcp_reachable if tcp_reachable else bool(gateway.get("reachable", False))
+    
+    # 使用 TCP 探测的延迟（如果有）
+    effective_latency_ms = tcp_latency_ms if tcp_latency_ms is not None else gateway.get("connectLatencyMs")
+    
     runtime_short = str(gateway_service.get("runtimeShort") or "")
     service_running = "running" in runtime_short.lower()
 
@@ -2091,11 +2485,9 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
     )
 
     # 3 态：正常 / 重启 / 离线
-    # gateway_reachable 可能因 token 权限不足而误报 false，
-    # 需要结合 gatewayService 的运行状态综合判断。
     if any(sig in runtime_lc for sig in restarting_signals):
         state = "Restarting"
-    elif service_running or gateway_reachable:
+    elif service_running or gateway_reachable or tcp_reachable:
         state = "Online"
     else:
         state = "Offline"
@@ -2107,9 +2499,9 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
         "state": state,
         "gateway": {
             "reachable": gateway_reachable,
-            "latencyMs": gateway.get("connectLatencyMs"),
-            "url": gateway.get("url"),
-            "service": runtime_short,
+            "latencyMs": effective_latency_ms,
+            "url": gateway.get("url") or "127.0.0.1:8080",
+            "service": runtime_short or ("running" if tcp_reachable else ""),
         },
         "security": {
             "critical": critical,
@@ -2330,6 +2722,8 @@ def create_app() -> Flask:
     if not _bg_warmup_started:
         t = threading.Thread(target=_bg_status_warmup_loop, daemon=True, name="clawstatus-warmup")
         t.start()
+        # 启动 inotify 事件监控（零轮询，Linux only）
+        _start_inotify_monitor()
         _bg_warmup_started = True
 
     # 仪表盘数据预热（异步），避免首次接口阻塞
@@ -2445,6 +2839,19 @@ def create_app() -> Flask:
             result = _trigger_cron_run(job_id)
         except KeyError:
             return jsonify({"error": "cron not found", "jobId": job_id}), 404
+        return jsonify(result)
+
+    @app.post("/api/crons/<job_id>/delete")
+    def api_cron_delete(job_id: str):
+        auth_resp = _require_auth(required_token)
+        if auth_resp is not None:
+            return auth_resp
+        try:
+            result = _delete_cron_job(job_id)
+        except KeyError:
+            return jsonify({"error": "cron not found", "jobId": job_id}), 404
+        except OSError as e:
+            return jsonify({"error": str(e), "jobId": job_id}), 500
         return jsonify(result)
 
     @app.get("/api/cron-monitor/<job_id>")
@@ -2623,6 +3030,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .speed-toggle {{ display:flex; gap:6px; }}
     .speed-btn {{ border:1px solid var(--line); background:var(--card); color:var(--muted); border-radius:999px; padding:6px 10px; font-size:12px; cursor:pointer; }}
     .speed-btn.active {{ color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }}
+    .speed-label {{ color:var(--muted); font-size:12px; align-self:center; }}
     .nav-tab {{ border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; }}
     .nav-tab.active {{ border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }}
     .page {{ display: none; }}
@@ -2682,7 +3090,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .status-chip.available, .status-chip.warn {{ color: var(--warn); border-color: rgba(245,158,11,.35); }}
     .status-chip.bad {{ color: var(--bad); border-color: rgba(248,113,113,.35); }}
     .status-chip.configured, .status-chip.muted {{ color: var(--muted); }}
-    .next-run {{ white-space: nowrap; }}
     .daily-chart {{ display:flex; align-items:flex-end; justify-content:space-between; gap:10px; min-height:240px; padding: 10px 6px 0; overflow: hidden; }}
     .daily-item {{ flex: 1 1 0; min-width: 44px; max-width: 72px; text-align:center; }}
     .daily-bar-wrap {{ height: 160px; display:flex; align-items:flex-end; justify-content:center; }}
@@ -2715,8 +3122,100 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     .modal-header, .modal-footer {{ display:flex; align-items:center; gap:12px; padding:14px 16px; }}
     .modal-body {{ padding:14px 16px; overflow:auto; }}
     body.modal-open {{ overflow:hidden; }}
-    @media (max-width: 1200px) {{ header {{ grid-template-columns: 1fr; }} h1 {{ justify-self: center; }} .nav {{ justify-content: center; }} .header-actions {{ justify-self:center; }} }}
-    @media (max-width: 1000px) {{ .grid {{ grid-template-columns: repeat(2,minmax(160px,1fr)); }} .monitor-grid {{ grid-template-columns: 1fr; }} .memory-layout {{ grid-template-columns: 1fr; }} .memory-meta-grid {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 1200px) {{ header {{ grid-template-columns: 1fr; gap: 10px; padding: 12px 16px; }} h1 {{ justify-self: center; font-size: 20px; }} .nav {{ justify-content: center; }} .header-actions {{ justify-self:center; }} }}
+    @media (max-width: 1000px) {{ .grid {{ grid-template-columns: repeat(2,minmax(160px,1fr)); }} .compact-grid {{ grid-template-columns: repeat(3, minmax(140px, 1fr)); }} .monitor-grid {{ grid-template-columns: 1fr; }} .memory-layout {{ grid-template-columns: 1fr; }} .memory-meta-grid {{ grid-template-columns: 1fr; }} .wrap {{ padding: 12px 16px 24px; }} }}
+    @media (max-width: 768px) {{ 
+      header {{ padding: 10px 12px; position: relative; }} 
+      h1 {{ font-size: 18px; }} 
+      .nav {{ gap: 6px; }} 
+      .nav-tab {{ padding: 6px 10px; font-size: 12px; }} 
+      .header-actions {{ flex-wrap: wrap; justify-content: center; gap: 8px; }} 
+      .speed-label {{ display: none; }} 
+      .speed-btn {{ padding: 5px 8px; font-size: 11px; }} 
+      .wrap {{ padding: 10px 12px 20px; }} 
+      .grid {{ grid-template-columns: repeat(2, 1fr); gap: 10px; }} 
+      .compact-grid {{ grid-template-columns: repeat(2, 1fr); gap: 8px; }} 
+      .compact-grid .card {{ padding: 10px; }} 
+      .compact-grid .v {{ font-size: 18px; }} 
+      .compact-grid .k {{ font-size: 11px; }} 
+      .card {{ padding: 12px; }} 
+      .v {{ font-size: 20px; }} 
+      .panel {{ padding: 10px; }} 
+      table {{ font-size: 12px; display: block; overflow-x: auto; white-space: nowrap; }} 
+      th, td {{ padding: 8px 6px; }} 
+      .monitor-box {{ min-height: 150px; }} 
+      .monitor-list-item {{ padding: 6px 8px; font-size: 12px; }} 
+      .monitor-content {{ font-size: 11px; max-height: 200px; }} 
+      .modal-dialog {{ width: calc(100vw - 16px); margin: 4vh auto; max-height: 92vh; }} 
+      .modal-header, .modal-footer {{ padding: 10px 12px; }} 
+      .modal-body {{ padding: 10px 12px; }} 
+      .daily-chart {{ min-height: 180px; gap: 6px; }} 
+      .daily-item {{ min-width: 36px; max-width: 56px; }} 
+      .daily-bar-wrap {{ height: 120px; }} 
+      .daily-value {{ font-size: 9px; }} 
+      .daily-label {{ font-size: 9px; }} 
+      .daily-legend {{ font-size: 11px; gap: 8px; }} 
+      .memory-list-item {{ padding: 8px; }} 
+      .memory-cap-title {{ font-size: 13px; }} 
+      .kv-key, .kv-value {{ font-size: 11px; }} 
+      .model-option {{ padding: 8px; }} 
+      .model-current {{ font-size: 11px; }} 
+      .btn {{ padding: 6px 10px; font-size: 12px; }} 
+    }}
+    @media (max-width: 480px) {{ 
+      header {{ padding: 8px 10px; }} 
+      h1 {{ font-size: 16px; }} 
+      .nav {{ gap: 4px; }} 
+      .nav-tab {{ padding: 5px 8px; font-size: 11px; border-radius: 6px; }} 
+      .lang-btn {{ padding: 5px 8px; font-size: 11px; }} 
+      .speed-btn {{ padding: 4px 6px; font-size: 10px; }} 
+      .wrap {{ padding: 8px 10px 16px; }} 
+      .grid {{ grid-template-columns: 1fr; gap: 8px; }} 
+      .compact-grid {{ grid-template-columns: repeat(2, 1fr); gap: 6px; }} 
+      .compact-grid .card {{ padding: 8px; }} 
+      .compact-grid .v {{ font-size: 16px; }} 
+      .compact-grid .k {{ font-size: 10px; }} 
+      .card {{ padding: 10px; }} 
+      .v {{ font-size: 18px; }} 
+      .v.sm {{ font-size: 14px; }} 
+      .k {{ font-size: 11px; }} 
+      .meta {{ font-size: 11px; }} 
+      .panel {{ padding: 8px; margin-top: 10px; }} 
+      .panel h3 {{ font-size: 14px; }} 
+      th, td {{ padding: 6px 4px; font-size: 11px; }} 
+      .pill {{ font-size: 10px; padding: 1px 6px; }} 
+      .monitor-box {{ min-height: 120px; padding: 8px; }} 
+      .monitor-title {{ font-size: 12px; }} 
+      .daily-chart {{ min-height: 150px; padding: 6px 4px 0; gap: 4px; }} 
+      .daily-item {{ min-width: 28px; max-width: 44px; }} 
+      .daily-bar-wrap {{ height: 100px; }} 
+      .daily-bar-stack {{ max-width: 32px; border-radius: 6px 6px 0 0; }} 
+      .daily-value {{ font-size: 8px; margin-bottom: 4px; }} 
+      .daily-label {{ font-size: 8px; margin-top: 4px; }} 
+      .status-chip {{ font-size: 10px; padding: 1px 6px; }} 
+      .memory-section-title {{ font-size: 13px; }} 
+      .memory-list-item {{ padding: 6px; }} 
+      .memory-cap-title {{ font-size: 12px; }} 
+      .kv-key, .kv-value {{ font-size: 10px; }} 
+      .btn-close {{ width: 28px; height: 28px; }} 
+      .btn-close::before, .btn-close::after {{ left: 13px; top: 5px; height: 16px; }} 
+    }}
+    @media (max-width: 360px) {{ 
+      .compact-grid {{ grid-template-columns: 1fr; }} 
+      .nav-tab {{ padding: 4px 6px; font-size: 10px; }} 
+      .daily-item {{ min-width: 24px; max-width: 36px; }} 
+      .daily-bar-wrap {{ height: 80px; }} 
+      .daily-bar-stack {{ max-width: 24px; }} 
+    }}
+    @media (hover: none) and (pointer: coarse) {{ 
+      .nav-tab {{ padding: 10px 12px; }} 
+      .nav-tab:active {{ transform: scale(0.98); }} 
+      .card {{ -webkit-tap-highlight-color: transparent; }} 
+      .speed-btn {{ padding: 8px 12px; }} 
+      .lang-btn {{ padding: 8px 12px; }} 
+      .monitor-list-item {{ padding: 10px; }} 
+      .model-option {{ padding: 12px; }} 
+    }}
   </style>
 </head>
 <body>
@@ -2730,10 +3229,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       <button class="nav-tab" data-page="memory" data-i18n="navMemory">Memory</button>
     </div>
     <div class="header-actions">
-      <div class="lang-toggle" aria-label="language">
-        <button class="lang-btn active" type="button" data-lang="en">EN</button>
-        <button class="lang-btn" type="button" data-lang="zh">中</button>
-      </div>
+      <span class="speed-label">Refresh</span>
       <div class="speed-toggle" aria-label="refresh speed">
         <button class="speed-btn" type="button" data-speed="fastest">Fastest</button>
         <button class="speed-btn" type="button" data-speed="fast">Fast</button>
@@ -2747,7 +3243,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     <section id="page-overview" class="page active">
       <div class="grid compact-grid" id="cards"></div>
       <div class="panel">
-        <h3 style="margin:4px 0 8px">Agents <span class="pill">incl. Sub-Agents</span><span class="pill" id="cd-agents">refreshing</span></h3>
+        <h3 style="margin:4px 0 8px">Agents <span class="pill">incl. Sub-Agents</span></h3>
         <table class="table table-hover align-middle mb-0">
           <thead><tr><th>Agent</th><th>Status</th><th>Sub-Agent</th><th>Sessions</th><th>Heartbeat</th><th>Current Model</th><th>Switch Model</th></tr></thead>
           <tbody id="agents-body"></tbody>
@@ -2775,7 +3271,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     <section id="page-crons" class="page">
       <div class="panel">
-        <h3 style="margin:4px 0 8px"><span data-i18n="cronsTitle">Cron Jobs</span> <span class="pill" id="cd-crons">refreshing</span></h3>
+        <h3 style="margin:4px 0 8px"><span data-i18n="cronsTitle">Cron Jobs</span></h3>
         <table class="table table-hover align-middle mb-0">
           <thead id="crons-head"></thead>
           <tbody id="crons-body"></tbody>
@@ -2785,7 +3281,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
 
     <section id="page-usage" class="page">
       <div class="panel">
-        <h3 style="margin:4px 0 8px">Daily Token Consumption (Last 15 Days) <span class="pill" id="cd-tokens">refreshing</span></h3>
+        <h3 style="margin:4px 0 8px">Daily Token Consumption (Last 15 Days)</h3>
         <div id="daily-token-meta" class="meta">Loading…</div>
         <div class="daily-legend">
           <span><i class="legend-dot" style="background:#2563eb"></i>Active</span>
@@ -2809,7 +3305,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         <div class="panel">
           <div class="memory-section-title">
             <h3 style="margin:0" data-i18n="memoryWorkspaceTitle">Memory Workspaces</h3>
-            <span class="pill" id="cd-memory">refreshing</span>
+
           </div>
           <table class="table table-hover align-middle mb-0">
             <thead><tr><th>Workspace</th><th>Entries</th><th>Today</th><th>Latest File</th><th>Updated</th></tr></thead>
@@ -2931,7 +3427,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       running: 'Running',
       lastStatus: 'Last Status',
       lastDuration: 'Last Duration',
-      nextRun: 'Next Run',
       task: 'Job',
       agent: 'Agent',
       model: 'Current Model',
@@ -2940,6 +3435,11 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       triggering: 'Running...',
       triggered: 'Triggered',
       triggerFailed: 'Trigger failed',
+      deleteCron: 'Delete',
+      deleting: 'Deleting...',
+      deleted: 'Deleted',
+      deleteFailed: 'Delete failed',
+      confirmDelete: 'Are you sure you want to delete this job?'}}
       workspace: 'Workspace',
       entries: 'Entries',
       todayAdded: 'Today',
@@ -2950,105 +3450,14 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       capabilitySource: 'Source',
       capabilityStatus: 'Status',
       automationEffect: 'Effect',
-      countdownSuffix: 'to refresh',
-      overdue: 'now',
+
     }};
-    const I18N_ZH = {{
-      title: '{APP_TITLE}',
-      navOverview: '概览',
-      navFlow: '流程',
-      navCrons: '定时任务',
-      navTokens: 'Token',
-      navMemory: '记忆',
-      cronsTitle: '定时任务',
-      memoryWorkspaceTitle: '工作区记忆',
-      memoryCapabilitiesTitle: '记忆能力',
-      memoryStorageTitle: '中央记忆与存储',
-      memoryAutomationTitle: '记忆自动化',
-      memoryImpactTitle: '自我升级 / 介入 对记忆的影响',
-      memoryRecentTitle: '近期记忆文件',
-      loading: '加载中…',
-      noData: '暂无数据',
-      noTasks: '暂无任务',
-      autoRefresh: '已自动刷新',
-      runningNow: '运行中',
-      idle: '空闲',
-      on: '开',
-      off: '关',
-      yes: '是',
-      save: '保存',
-      cancel: '取消',
-      switchModel: '切换模型',
-      currentModel: '当前模型',
-      chooseModel: '选择模型',
-      saving: '保存中…',
-      saveFailed: '保存失败',
-      restarting: '正在重启 OpenClaw…',
-      restartFailed: '模型已保存，但 OpenClaw 重启失败',
-      noValidModels: '当前没有可切换的有效模型。',
-      schedule: '频率',
-      enabled: '已启用',
-      running: '运行中',
-      lastStatus: '上次状态',
-      lastDuration: '上次耗时',
-      nextRun: '下次执行',
-      task: '任务',
-      agent: 'Agent',
-      model: '当前模型',
-      switchModelBtn: '切换模型',
-      triggerRun: '立即运行',
-      triggering: '运行中…',
-      triggered: '已触发',
-      triggerFailed: '触发失败',
-      workspace: '工作区',
-      entries: '条目数',
-      todayAdded: '今日新增',
-      latestFile: '最新文件',
-      updatedAt: '更新时间',
-      file: '文件',
-      size: '大小',
-      capabilitySource: '来源',
-      capabilityStatus: '状态',
-      automationEffect: '效果',
-      countdownSuffix: '后刷新',
-      overdue: '立即',
-    }};
-    const LANG_KEY = 'clawstatus-lang';
-    let currentLang = localStorage.getItem(LANG_KEY) || 'en';
+    const currentLang = 'en';
 
     function t(key) {{
-      const table = currentLang === 'zh' ? I18N_ZH : I18N;
-      return (table && table[key]) || I18N[key] || key;
+      return I18N[key] || key;
     }}
 
-    function applyLang(lang) {{
-      currentLang = (lang === 'zh') ? 'zh' : 'en';
-      localStorage.setItem(LANG_KEY, currentLang);
-      document.querySelectorAll('.lang-btn').forEach(b => {{
-        b.classList.toggle('active', b.getAttribute('data-lang') === currentLang);
-      }});
-      document.querySelectorAll('[data-i18n]').forEach(el => {{
-        const k = el.getAttribute('data-i18n');
-        if (k) el.textContent = t(k);
-      }});
-    }}
-
-    function fmtRelative(ms) {{
-      const delta = Number(ms || 0) - Date.now();
-      if (!Number.isFinite(delta) || !ms) return '-';
-      if (delta <= 0) return t('overdue');
-      const sec = Math.floor(delta / 1000);
-      if (sec < 60) return `${{sec}}s`;
-      const min = Math.floor(sec / 60);
-      const remSec = sec % 60;
-      if (min < 60) return `${{min}}m${{remSec}}s`;
-      const hour = Math.floor(min / 60);
-      const remMin = min % 60;
-      if (hour < 24) return `${{hour}}h${{remMin}}m`;
-      const day = Math.floor(hour / 24);
-      const remHour = hour % 24;
-      return `${{day}}d${{remHour}}h`;
-    }}
 
     function statusText(status, tone) {{
       return `<span class="${{tone || 'muted'}}">${{escapeHtml(status || '-')}}</span>`;
@@ -3115,20 +3524,19 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     const VALID_PAGES = new Set(['overview', 'flow', 'crons', 'usage', 'memory']);
     let activePage = 'overview';
 
+    // 自动刷新配置 - 简洁高效
     const refreshState = {{
-      overview: {{ url: '/api/overview', interval: 15, remain: 1, page: 'overview' }},
-      openclaw: {{ url: '/api/openclaw', interval: 30, remain: 2, page: 'overview' }},
-      agents: {{ url: '/api/agents', interval: 30, remain: 3, page: 'overview' }},
-      crons: {{ url: '/api/crons', interval: 60, remain: 4, page: 'crons' }},
-      models: {{ url: '/api/models', interval: 120, remain: 6, page: 'usage' }},
-      memory: {{ url: '/api/memory', interval: 120, remain: 8, page: 'memory' }},
+      overview: {{ url: '/api/overview', interval: 5, next: 0, page: 'overview' }},      // 5秒 - 核心概览
+      openclaw: {{ url: '/api/openclaw', interval: 10, next: 0, page: 'overview' }},     // 10秒 - 服务状态
+      agents: {{ url: '/api/agents', interval: 3, next: 0, page: 'overview' }},          // 3秒 - Agent实时状态
+      crons: {{ url: '/api/crons', interval: 10, next: 0, page: 'crons' }},              // 10秒 - Cron任务
+      models: {{ url: '/api/models', interval: 60, next: 0, page: 'usage' }},            // 60秒 - 模型统计（低频）
+      memory: {{ url: '/api/memory', interval: 30, next: 0, page: 'memory' }},           // 30秒 - 内存数据
     }};
 
+    // 刷新速度档位（倍数作用于基础间隔）
     const SPEED_KEY = 'clawstatus-speed';
-    const SPEED_BASE = {{
-      overview: 15, openclaw: 30, agents: 30, crons: 60, models: 120, memory: 120,
-    }};
-    const SPEED_MULT = {{ fastest: 0.25, fast: 0.5, medium: 1, slow: 2 }};
+    const SPEED_MULT = {{ fastest: 0.3, fast: 0.6, medium: 1, slow: 2 }};
     let currentSpeed = localStorage.getItem(SPEED_KEY) || 'medium';
     if (!SPEED_MULT[currentSpeed]) currentSpeed = 'medium';
 
@@ -3136,9 +3544,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       currentSpeed = SPEED_MULT[speed] ? speed : 'medium';
       localStorage.setItem(SPEED_KEY, currentSpeed);
       const mult = SPEED_MULT[currentSpeed];
-      Object.keys(SPEED_BASE).forEach(key => {{
+      Object.keys(refreshState).forEach(key => {{
         if (refreshState[key]) {{
-          refreshState[key].interval = Math.max(3, Math.round(SPEED_BASE[key] * mult));
+          const base = refreshState[key].interval;
+          refreshState[key]._interval = Math.max(2, Math.round(base * mult));
         }}
       }});
       document.querySelectorAll('.speed-btn').forEach(btn => {{
@@ -3150,11 +3559,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       btn.addEventListener('click', () => applySpeed(btn.getAttribute('data-speed')));
     }});
     applySpeed(currentSpeed);
-
-    document.querySelectorAll('.lang-btn').forEach(btn => {{
-      btn.addEventListener('click', () => applyLang(btn.getAttribute('data-lang')));
-    }});
-    applyLang(currentLang);
 
     const refreshingKeys = new Set();
     let selectedCronId = null;
@@ -3202,7 +3606,10 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const conf = refreshState[key];
       if (!conf) return;
       if (refreshingKeys.has(key)) return;
-      if (!force && conf.remain > 0) return;
+      
+      const now = Date.now();
+      const interval = conf._interval || conf.interval;
+      if (!force && now < conf.next) return;
 
       const headers = {{}};
       if (token()) headers['Authorization'] = 'Bearer ' + token();
@@ -3222,7 +3629,8 @@ def _index_html(auth_token: Optional[str] = None) -> str:
         }}
 
         dashboardState.generatedAt = Date.now();
-        conf.remain = conf.interval;
+        const interval = conf._interval || conf.interval;
+        conf.next = Date.now() + interval * 1000;
         render(dashboardState);
         saveSnapshot();
       }} catch (e) {{
@@ -3358,7 +3766,6 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       `).join('') || '<tr><td colspan="9" class="meta">' + t('noData') + '</td></tr>';
 
       renderMemory(d.memory || {{}});
-      paintRelativeTimes();
     }}
 
     function renderCronTable(data) {{
@@ -3379,9 +3786,9 @@ def _index_html(auth_token: Optional[str] = None) -> str:
             <th>${{t('model')}}</th>
             <th>${{t('lastStatus')}}</th>
             <th>${{t('lastDuration')}}</th>
-            <th>${{t('nextRun')}}</th>
             <th>${{t('switchModelBtn')}}</th>
             <th>${{t('triggerRun')}}</th>
+            <th>${{t('deleteCron')}}</th>
           </tr>
         `;
       }}
@@ -3396,13 +3803,14 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           <td>${{escapeHtml(c.currentModel || '-')}}</td>
           <td>${{statusText(c.lastStatus || '-', c.lastStatusTone)}}</td>
           <td>${{c.lastDurationMs ? Math.round(c.lastDurationMs/1000)+'s' : '-'}}</td>
-          <td class="next-run" data-next-run-ms="${{c.nextRunAtMs || ''}}">${{fmtRelative(c.nextRunAtMs)}}</td>
           <td class="model-cell">${{renderModelSwitchButton('cron', c.id, c.currentModel, cronModels)}}</td>
           <td><button class="btn-monitor btn-cron-run" data-cron-id="${{escapeHtml(c.id)}}">${{t('triggerRun')}}</button></td>
+          <td><button class="btn-monitor btn-cron-delete" data-cron-id="${{escapeHtml(c.id)}}" data-cron-name="${{escapeHtml(c.name || c.id || '')}}">${{t('deleteCron')}}</button></td>
         </tr>
       `).join('') || `<tr><td colspan="${{colspan}}" class="meta">${{t('noTasks')}}</td></tr>`;
       bindModelSwitchButtons('cron');
       bindCronRunButtons();
+      bindCronDeleteButtons();
     }}
 
     function bindCronRunButtons() {{
@@ -3431,6 +3839,49 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           setTimeout(() => {{
             btn.disabled = false;
             btn.textContent = t('triggerRun');
+            btn.style.color = '';
+          }}, 5000);
+        }});
+      }});
+    }}
+
+    function bindCronDeleteButtons() {{
+      document.querySelectorAll('.btn-cron-delete').forEach(btn => {{
+        btn.addEventListener('click', async () => {{
+          const jobId = btn.getAttribute('data-cron-id');
+          const jobName = btn.getAttribute('data-cron-name') || jobId;
+          
+          // 确认对话框
+          if (!confirm(`${{t('confirmDelete')}}\n\n${{jobName}}`)) {{
+            return;
+          }}
+          
+          btn.disabled = true;
+          btn.textContent = t('deleting');
+          btn.style.color = 'var(--warn)';
+          
+          const hdrs = {{}};
+          if (token()) hdrs['Authorization'] = 'Bearer ' + token();
+          
+          try {{
+            const result = await postJson(`/api/crons/${{encodeURIComponent(jobId)}}/delete`, {{}}, hdrs);
+            if (result && result.deleted) {{
+              btn.textContent = '✓ ' + t('deleted');
+              btn.style.color = 'var(--ok)';
+              // 立即刷新列表
+              setTimeout(() => refreshOne('crons', true), 1000);
+            }} else {{
+              btn.textContent = t('deleteFailed');
+              btn.style.color = 'var(--bad)';
+            }}
+          }} catch (e) {{
+            btn.textContent = t('deleteFailed');
+            btn.style.color = 'var(--bad)';
+          }}
+          
+          setTimeout(() => {{
+            btn.disabled = false;
+            btn.textContent = t('deleteCron');
             btn.style.color = '';
           }}, 5000);
         }});
@@ -3859,49 +4310,25 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       setActivePage(page, {{ forceRefresh: true, replaceUrl: true }});
     }});
 
-    function paintRelativeTimes() {{
-      document.querySelectorAll('[data-next-run-ms]').forEach((el) => {{
-        const raw = el.getAttribute('data-next-run-ms');
-        el.textContent = fmtRelative(raw ? Number(raw) : 0);
-      }});
-    }}
-
-    function paintCountdown() {{
-      const map = {{
-        '#cd-agents': (refreshState.agents && refreshState.agents.remain != null) ? refreshState.agents.remain : 0,
-        '#cd-crons': (refreshState.crons && refreshState.crons.remain != null) ? refreshState.crons.remain : 0,
-        '#cd-tokens': (refreshState.models && refreshState.models.remain != null) ? refreshState.models.remain : 0,
-        '#cd-memory': (refreshState.memory && refreshState.memory.remain != null) ? refreshState.memory.remain : 0,
-      }};
-      Object.entries(map).forEach(([sel, sec]) => {{
-        const el = $(sel);
-        if (el) el.textContent = `${{sec}}s ${{t('countdownSuffix')}}`;
-      }});
-    }}
-
-    paintCountdown();
+    // 启动自动刷新
     bootstrapRefresh();
     bindModelSwitchModal();
 
+    // 主刷新循环 - 每500ms检查一次，精准触发
     setInterval(() => {{
       if (document.hidden) return;
-
-      Object.values(refreshState).forEach(conf => {{
-        conf.remain -= 1;
-        if (conf.remain < 0) conf.remain = 0;
-      }});
-
+      
+      const now = Date.now();
       const activeKeys = new Set(keysForPage(activePage));
+      
       Object.keys(refreshState).forEach(key => {{
+        if (!activeKeys.has(key)) return;
         const conf = refreshState[key];
-        if (conf.remain <= 0 && activeKeys.has(key)) {{
+        if (now >= conf.next) {{
           refreshOne(key, true);
         }}
       }});
-
-      paintCountdown();
-      paintRelativeTimes();
-    }}, 1000);
+    }}, 500);
   </script>
 </body>
 </html>
@@ -4029,6 +4456,81 @@ def _run_server(host: str, port: int, debug: bool) -> int:
     return 0
 
 
+def _get_file_mtime(path: str) -> float:
+    """获取文件修改时间"""
+    try:
+        return os.path.getmtime(path)
+    except Exception:
+        return 0.0
+
+
+def _run_dev_mode(host: str, port: int) -> int:
+    """
+    开发者模式：监控文件变化并自动重启。
+    使用子进程 + exec 实现无缝重启，保持简单零依赖。
+    """
+    import signal
+    import subprocess
+    import sys
+    
+    # 当前文件路径
+    self_path = os.path.abspath(__file__)
+    
+    # 文件监控间隔（秒）
+    check_interval = 1.0
+    
+    print(f"[DEV] Starting in developer mode...")
+    print(f"[DEV] Watching: {self_path}")
+    print(f"[DEV] Server: http://{host}:{port}")
+    print(f"[DEV] Press Ctrl+C to stop\n")
+    
+    # 记录启动时的文件修改时间
+    last_mtime = _get_file_mtime(self_path)
+    
+    # 启动子进程运行服务器
+    while True:
+        # 使用 subprocess 启动子进程
+        cmd = [sys.executable, self_path, "--host", host, "--port", str(port), "--debug"]
+        
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=os.path.dirname(self_path),
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                stdin=sys.stdin,
+            )
+            
+            # 监控循环
+            while proc.poll() is None:
+                time.sleep(check_interval)
+                
+                current_mtime = _get_file_mtime(self_path)
+                if current_mtime > last_mtime:
+                    last_mtime = current_mtime
+                    print(f"\n[DEV] File changed, restarting...")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    break  # 外层循环会重新启动
+                    
+        except KeyboardInterrupt:
+            print("\n[DEV] Stopping...")
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            return 0
+        except Exception as e:
+            print(f"[DEV] Error: {e}")
+            time.sleep(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=f"{APP_TITLE} dashboard")
     parser.add_argument("command", nargs="?", default="serve", choices=["serve", "start", "stop", "restart", "status"])
@@ -4036,6 +4538,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8900, help="bind port")
     parser.add_argument("--debug", action="store_true", help="enable Flask debug mode")
     parser.add_argument("--no-debug", action="store_true", help="disable debug mode")
+    parser.add_argument("--dev", action="store_true", help="developer mode: auto-reload on file changes")
     parser.add_argument("--version", action="store_true", help="print version and exit")
     return parser
 
@@ -4059,6 +4562,10 @@ def main() -> int:
     if args.command == "restart":
         _cmd_stop()
         return _cmd_start(args.host, args.port, debug)
+
+    # 开发者模式：文件变化自动重启
+    if args.dev:
+        return _run_dev_mode(args.host, args.port)
 
     return _run_server(args.host, args.port, debug)
 
