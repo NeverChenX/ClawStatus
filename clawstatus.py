@@ -33,7 +33,7 @@ try:
 except Exception:  # pragma: no cover
     waitress_serve = None
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 APP_TITLE = "ClawStatus"
 
 HOME = Path.home()
@@ -2393,7 +2393,7 @@ def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any])
                 "workspaceDir": a.get("workspaceDir"),
                 "sessionsCount": int(a.get("sessionsCount") or 0),
                 "lastUpdatedAt": a.get("lastUpdatedAt"),
-                "lastActiveAgeMs": age_ms,
+                "lastActiveAgeMs": effective_age_ms,
                 "running": bool(agent_running),
                 "subagentsTotal": len(own_subs),
                 "subagentsRunning": sub_running,
