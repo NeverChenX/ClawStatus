@@ -17,6 +17,7 @@ import json
 import mmap
 import os
 import signal
+import socket
 import subprocess
 import threading
 import sys
@@ -70,6 +71,7 @@ _TCP_PROBE_TIMEOUT_SEC = 0.5  # TCP connection timeout (seconds)
 _TCP_PROBE_CACHE_TTL_SEC = 30  # 30s cache for TCP probe results
 _tcp_probe_cache: Dict[str, Any] = {"ts": 0.0, "reachable": False, "latency_ms": None}
 _tcp_probe_lock = threading.Lock()
+_TCP_PROBE_DEFAULT_PORT = 18789  # OpenClaw gateway default port
 _dash_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 _daily_tokens_cache: Dict[str, Any] = {
     "ts": 0.0,
@@ -271,10 +273,11 @@ def _refresh_openclaw_status() -> Tuple[Optional[Dict[str, Any]], Optional[str]]
                 return data, None
             last_err = err
 
+        # When refresh fails, clear stale data so TCP probe drives state detection.
+        # Keeping stale data with a fresh timestamp would make it look "fresh" forever.
         with _status_lock:
-            old = _status_cache.get("data")
-            _status_cache.update({"ts": now, "data": old, "err": last_err})
-        return old, last_err
+            _status_cache.update({"ts": now, "data": None, "err": last_err})
+        return None, last_err
     finally:
         with _status_lock:
             _status_refreshing = False
@@ -347,17 +350,44 @@ def _load_auth_token() -> Optional[str]:
     return token or None
 
 
+def _resolve_openclaw_port() -> int:
+    """Resolve OpenClaw gateway port from env var, cached status, or default."""
+    # 1. Env var override
+    env_port = os.environ.get("OPENCLAW_GATEWAY_PORT", "").strip()
+    if env_port.isdigit():
+        return int(env_port)
+
+    # 2. Extract from cached status data gateway URL (e.g. "ws://127.0.0.1:18789")
+    with _status_lock:
+        cached_data = _status_cache.get("data")
+    if cached_data:
+        gw_url = (cached_data.get("gateway") or {}).get("url", "")
+        if gw_url:
+            try:
+                # Parse port from URLs like "ws://127.0.0.1:18789" or "http://host:port"
+                from urllib.parse import urlparse
+                parsed = urlparse(gw_url)
+                if parsed.port:
+                    return parsed.port
+            except Exception:
+                pass
+
+    # 3. Default
+    return _TCP_PROBE_DEFAULT_PORT
+
+
 def _tcp_probe_openclaw() -> Tuple[bool, Optional[int]]:
     """
     TCP port probe to check if OpenClaw is alive.
     Minimal implementation: completes in 1-3ms, no subprocess, no HTTP overhead.
     Returns: (is_reachable, latency_ms)
     """
+    port = _resolve_openclaw_port()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(_TCP_PROBE_TIMEOUT_SEC)
         start = time.time()
-        result = sock.connect_ex(('127.0.0.1', 8080))
+        result = sock.connect_ex(('127.0.0.1', port))
         latency_ms = int((time.time() - start) * 1000)
         sock.close()
         return result == 0, latency_ms
@@ -2461,8 +2491,12 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
     critical = int((security.get("summary") or {}).get("critical") or 0)
     warns = int((security.get("summary") or {}).get("warn") or 0)
 
-    # Prefer TCP probe result for reachability (faster and more accurate)
-    gateway_reachable = tcp_reachable if tcp_reachable else bool(gateway.get("reachable", False))
+    # Prefer TCP probe result for reachability (faster and more accurate).
+    # When TCP probe explicitly returns False, trust it over stale cached gateway.reachable.
+    if tcp_reachable is not None:
+        gateway_reachable = tcp_reachable
+    else:
+        gateway_reachable = bool(gateway.get("reachable", False))
 
     # Use TCP probe latency if available
     effective_latency_ms = tcp_latency_ms if tcp_latency_ms is not None else gateway.get("connectLatencyMs")
