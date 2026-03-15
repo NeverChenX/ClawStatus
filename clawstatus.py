@@ -48,25 +48,26 @@ RUNTIME_DIR = HOME / ".clawstatus"
 PID_FILE = RUNTIME_DIR / "clawstatus.pid"
 LOG_FILE = RUNTIME_DIR / "clawstatus.log"
 
-ACTIVE_AGENT_WINDOW_MS = 30 * 1000  # 30s window for more sensitive stop detection
-_REFRESH_INTERVAL_SEC = 30
+ACTIVE_AGENT_WINDOW_MS = 60 * 1000  # 60s window for stop detection (reduced sensitivity)
+_REFRESH_INTERVAL_SEC = 60
 
-# Agent real-time detection cache (ultra-lightweight)
+# Agent real-time detection cache (lightweight)
 _agent_fs_cache: Dict[str, Tuple[float, bool, Optional[int]]] = {}
 _agent_fs_cache_lock = threading.Lock()
-_agent_fs_cache_ttl_sec = 1  # 1s cache for fast response
-_STATUS_CACHE_TTL_SEC = 60
-_STATUS_WARMUP_INTERVAL_SEC = 120
-_STATUS_WARMUP_IDLE_GRACE_SEC = 600
-_DASH_CACHE_TTL_SEC = 30
-_DAILY_TOKENS_TTL_SEC = 300
-_DAILY_FILELIST_TTL_SEC = 900
-_MODELS_CACHE_TTL_SEC = 300
-_MEMORY_CACHE_TTL_SEC = 300
+_agent_fs_cache_ttl_sec = 5  # 5s cache to reduce filesystem scans
+_STATUS_CACHE_TTL_SEC = 120  # 2 min cache for openclaw status
+_STATUS_WARMUP_INTERVAL_SEC = 300  # 5 min warmup interval
+_STATUS_WARMUP_IDLE_GRACE_SEC = 900  # 15 min idle grace
+_DASH_CACHE_TTL_SEC = 60  # 1 min dashboard cache
+_DAILY_TOKENS_TTL_SEC = 600  # 10 min token stats cache
+_DAILY_FILELIST_TTL_SEC = 1800  # 30 min filelist cache
+_MODELS_CACHE_TTL_SEC = 600  # 10 min models cache
+_MEMORY_CACHE_TTL_SEC = 600  # 10 min memory cache
 _status_cache: Dict[str, Any] = {"ts": 0.0, "data": None, "err": None}
 
 # TCP port probe config (minimal, completes in 1-3ms)
 _TCP_PROBE_TIMEOUT_SEC = 0.5  # TCP connection timeout (seconds)
+_TCP_PROBE_CACHE_TTL_SEC = 30  # 30s cache for TCP probe results
 _tcp_probe_cache: Dict[str, Any] = {"ts": 0.0, "reachable": False, "latency_ms": None}
 _tcp_probe_lock = threading.Lock()
 _dash_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
@@ -119,11 +120,11 @@ def _safe_read_json(path: Path, default: Any) -> Any:
 
 
 def _read_json_tolerant(path: Path, default: Any) -> Any:
-    “””Read JSON file with minor format errors (try inserting comma at parse break).”””
+    """Read JSON file with minor format errors (try inserting comma at parse break)."""
     try:
         if not path.exists():
             return default
-        text = path.read_text(encoding=”utf-8”, errors=”replace”)
+        text = path.read_text(encoding="utf-8", errors="replace")
         return json.loads(text)
     except json.JSONDecodeError as e:
         # Only try inserting comma when values are directly adjacent at error position
@@ -1337,7 +1338,7 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
 
         end_offset, full_map = _scan_usage_jsonl(p, 0, day_keys)
         if end_offset == 0 and size > 0:
-            # On rescan failure, keep “rolled back and cache cleared” state to avoid hanging overcount
+            # On rescan failure, keep "rolled back and cache cleared" state to avoid hanging overcount
             continue
 
         full_map = {k: int(v or 0) for k, v in full_map.items()}
@@ -1574,7 +1575,7 @@ def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
         row.pop("_activeSessionSet", None)
         row.pop("_passiveSessionSet", None)
 
-    # Fill in “configured but unused” models
+    # Fill in "configured but unused" models
     for model_id, meta in configured_models.items():
         usage.setdefault(
             model_id,
@@ -2113,7 +2114,7 @@ def _describe_schedule(schedule: Any) -> str:
 
 # Cron run files cache
 _cron_run_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
-_cron_run_cache_ttl_sec = 5  # 5 second cache
+_cron_run_cache_ttl_sec = 30  # 30 second cache
 
 
 def _prefetch_cron_run_files(jobs: List[Dict[str, Any]]) -> None:
@@ -3519,14 +3520,14 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     const VALID_PAGES = new Set(['overview', 'flow', 'crons', 'usage', 'memory']);
     let activePage = 'overview';
 
-    // Auto-refresh config - simple and efficient
+    // Auto-refresh config - optimized for low resource usage
     const refreshState = {{
-      overview: {{ url: '/api/overview', interval: 5, next: 0, page: 'overview' }},      // 5s - core overview
-      openclaw: {{ url: '/api/openclaw', interval: 10, next: 0, page: 'overview' }},     // 10s - service status
-      agents: {{ url: '/api/agents', interval: 3, next: 0, page: 'overview' }},          // 3s - Agent real-time status
-      crons: {{ url: '/api/crons', interval: 10, next: 0, page: 'crons' }},              // 10s - Cron tasks
-      models: {{ url: '/api/models', interval: 60, next: 0, page: 'usage' }},            // 60s - model stats (low freq)
-      memory: {{ url: '/api/memory', interval: 30, next: 0, page: 'memory' }},           // 30s - memory data
+      overview: {{ url: '/api/overview', interval: 30, next: 0, page: 'overview' }},     // 30s - core overview
+      openclaw: {{ url: '/api/openclaw', interval: 60, next: 0, page: 'overview' }},     // 60s - service status
+      agents: {{ url: '/api/agents', interval: 15, next: 0, page: 'overview' }},         // 15s - Agent status
+      crons: {{ url: '/api/crons', interval: 30, next: 0, page: 'crons' }},              // 30s - Cron tasks
+      models: {{ url: '/api/models', interval: 120, next: 0, page: 'usage' }},           // 120s - model stats
+      memory: {{ url: '/api/memory', interval: 120, next: 0, page: 'memory' }},          // 120s - memory data
     }};
 
     // Refresh speed tiers (multiplier on base interval)
@@ -4309,13 +4310,13 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     bootstrapRefresh();
     bindModelSwitchModal();
 
-    // Main refresh loop - check every 500ms, precise triggering
+    // Main refresh loop - check every 2s for low resource usage
     setInterval(() => {{
       if (document.hidden) return;
-      
+
       const now = Date.now();
       const activeKeys = new Set(keysForPage(activePage));
-      
+
       Object.keys(refreshState).forEach(key => {{
         if (!activeKeys.has(key)) return;
         const conf = refreshState[key];
@@ -4323,7 +4324,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           refreshOne(key, true);
         }}
       }});
-    }}, 500);
+    }}, 2000);
   </script>
 </body>
 </html>
