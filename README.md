@@ -1,26 +1,26 @@
 # ClawStatus
 
-独立的 OpenClaw 状态看板项目，用于查看设备、会话、模型与 Token 消耗概览。
+A standalone OpenClaw status dashboard for monitoring devices, sessions, models, and token usage.
 
-## 特性
+## Features
 
-- 单文件启动的状态看板
-- 适合本机或局域网访问
-- 提供设备状态、会话统计、模型与近 15 天 Token 消耗概览
+- Single-file status dashboard
+- Suitable for local or LAN access
+- Displays device status, session statistics, model info, and 15-day token usage overview
 
-## 安装
+## Installation
 
 ```bash
 pip install --user -e .
 ```
 
-## 运行
+## Usage
 
 ```bash
 clawstatus --host 0.0.0.0 --port 8900 --no-debug
 ```
 
-## 服务管理（systemd --user）
+## Service Management (systemd --user)
 
 ```bash
 systemctl --user restart clawstatus.service

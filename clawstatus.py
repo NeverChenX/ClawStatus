@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-ClawStatus - OpenClaw 状态看板
+ClawStatus - OpenClaw Status Dashboard
 
-核心能力：
-1) Agent / Sub-agent 运行概览
-2) Cron 任务数量与执行状态
-3) OpenClaw 总体健康状态
-4) 模型配置数量与各模型 token 处理量（基于 sessions 快照聚合）
+Core features:
+1) Agent / Sub-agent runtime overview
+2) Cron job count and execution status
+3) OpenClaw overall health status
+4) Model configuration count and per-model token usage (aggregated from session snapshots)
 """
 
 from __future__ import annotations
@@ -48,13 +48,13 @@ RUNTIME_DIR = HOME / ".clawstatus"
 PID_FILE = RUNTIME_DIR / "clawstatus.pid"
 LOG_FILE = RUNTIME_DIR / "clawstatus.log"
 
-ACTIVE_AGENT_WINDOW_MS = 30 * 1000  # 30秒窗口，更敏感地检测停止
+ACTIVE_AGENT_WINDOW_MS = 30 * 1000  # 30s window for more sensitive stop detection
 _REFRESH_INTERVAL_SEC = 30
 
-# Agent 实时检测缓存（极致轻量）
+# Agent real-time detection cache (ultra-lightweight)
 _agent_fs_cache: Dict[str, Tuple[float, bool, Optional[int]]] = {}
 _agent_fs_cache_lock = threading.Lock()
-_agent_fs_cache_ttl_sec = 1  # 1秒缓存，极速响应
+_agent_fs_cache_ttl_sec = 1  # 1s cache for fast response
 _STATUS_CACHE_TTL_SEC = 60
 _STATUS_WARMUP_INTERVAL_SEC = 120
 _STATUS_WARMUP_IDLE_GRACE_SEC = 600
@@ -65,8 +65,8 @@ _MODELS_CACHE_TTL_SEC = 300
 _MEMORY_CACHE_TTL_SEC = 300
 _status_cache: Dict[str, Any] = {"ts": 0.0, "data": None, "err": None}
 
-# TCP 端口探测配置（极简，1-3ms 完成）
-_TCP_PROBE_TIMEOUT_SEC = 0.5  # TCP 连接超时（秒）
+# TCP port probe config (minimal, completes in 1-3ms)
+_TCP_PROBE_TIMEOUT_SEC = 0.5  # TCP connection timeout (seconds)
 _tcp_probe_cache: Dict[str, Any] = {"ts": 0.0, "reachable": False, "latency_ms": None}
 _tcp_probe_lock = threading.Lock()
 _dash_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
@@ -119,14 +119,14 @@ def _safe_read_json(path: Path, default: Any) -> Any:
 
 
 def _read_json_tolerant(path: Path, default: Any) -> Any:
-    """读取有轻微格式错误的 JSON 文件（仅在解析断点处尝试补逗号）。"""
+    “””Read JSON file with minor format errors (try inserting comma at parse break).”””
     try:
         if not path.exists():
             return default
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding=”utf-8”, errors=”replace”)
         return json.loads(text)
     except json.JSONDecodeError as e:
-        # 仅在报错位置附近是“值与值直接相邻”时，尝试插入一个逗号
+        # Only try inserting comma when values are directly adjacent at error position
         i = int(e.pos) - 1
         j = int(e.pos)
         while i >= 0 and text[i].isspace():
@@ -208,7 +208,7 @@ def _extract_json_blob(text: str) -> Optional[Dict[str, Any]]:
         try:
             obj, end = decoder.raw_decode(text, start)
             if isinstance(obj, dict):
-                # 优先返回更像 openclaw status 的对象
+                # Prefer returning object that looks more like openclaw status
                 if any(k in obj for k in ("heartbeat", "gateway", "sessions", "agents", "channelSummary")):
                     return obj
                 if best is None or len(obj) > len(best):
@@ -230,11 +230,11 @@ def _run_status_cmd(cmd: List[str], timeout_sec: int) -> Tuple[Optional[Dict[str
             check=False,
         )
     except FileNotFoundError:
-        return None, "openclaw 命令不存在（PATH 未找到）"
+        return None, "openclaw command not found (not in PATH)"
     except subprocess.TimeoutExpired:
-        return None, f"{' '.join(cmd[1:])} 执行超时"
+        return None, f"{' '.join(cmd[1:])} execution timeout"
     except Exception as e:
-        return None, f"openclaw status 调用失败: {e}"
+        return None, f"openclaw status call failed: {e}"
 
     merged = (proc.stdout or "") + "\n" + (proc.stderr or "")
     data = _extract_json_blob(merged)
@@ -242,21 +242,21 @@ def _run_status_cmd(cmd: List[str], timeout_sec: int) -> Tuple[Optional[Dict[str
         return data, None
 
     snippet = merged.strip().splitlines()[:3]
-    hint = " | ".join(snippet) if snippet else "无输出"
-    return None, f"无法解析 openclaw status 输出（rc={proc.returncode}）：{hint[:240]}"
+    hint = " | ".join(snippet) if snippet else "no output"
+    return None, f"Failed to parse openclaw status output (rc={proc.returncode}): {hint[:240]}"
 
 
 def _refresh_openclaw_status() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """执行一次真实的 openclaw status 刷新，并写入缓存。"""
+    """Execute a real openclaw status refresh and write to cache."""
     global _status_refreshing
 
     now = time.time()
     openclaw_bin = os.environ.get("OPENCLAW_BIN") or shutil.which("openclaw") or str(HOME / ".npm-global" / "bin" / "openclaw")
 
-    # 默认使用轻量路径，降低周期性预热对系统资源的影响。
+    # Use lightweight path by default to reduce periodic warmup resource impact.
     attempts = [([openclaw_bin, "status", "--json"], 20)]
 
-    # 如需强制拉 usage，可通过环境变量启用；默认关闭。
+    # Enable usage fetch via env var if needed; disabled by default.
     if (os.environ.get("CLAWSTATUS_ENABLE_STATUS_USAGE") or "").strip() == "1":
         attempts.append(([openclaw_bin, "status", "--json", "--usage"], 25))
 
@@ -290,7 +290,7 @@ def _start_status_refresh() -> None:
 
 
 def _run_openclaw_status() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """优先返回缓存，避免 API 请求阻塞。冷启动时才同步执行。"""
+    """Return cache first to avoid blocking API requests. Execute sync only on cold start."""
     global _last_status_demand_ts
 
     now = time.time()
@@ -300,26 +300,26 @@ def _run_openclaw_status() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         cached_err = _status_cache.get("err")
         cached_ts = float(_status_cache.get("ts", 0) or 0)
 
-    # 缓存新鲜
+    # Cache is fresh
     if cached_data is not None and now - cached_ts < _STATUS_CACHE_TTL_SEC:
         return cached_data, cached_err
 
-    # 缓存过期但存在：直接返回旧值（速度优先），同时触发后台刷新（准确性优先）
+    # Cache expired but exists: return stale value (speed first), trigger background refresh (accuracy first)
     if cached_data is not None:
         _start_status_refresh()
         return cached_data, cached_err
 
-    # 冷启动无缓存：同步拉一次，避免页面空白
+    # Cold start no cache: sync fetch once to avoid blank page
     return _refresh_openclaw_status()
 
 
 def _bg_status_warmup_loop() -> None:
-    """后台静默预热状态缓存。"""
-    _refresh_openclaw_status()  # 启动即预热
+    """Background silent cache warmup."""
+    _refresh_openclaw_status()  # Warmup on start
     while True:
         time.sleep(_STATUS_WARMUP_INTERVAL_SEC)
 
-        # 长时间无人访问时暂停预热，避免无意义子进程开销
+        # Pause warmup when idle for too long to avoid unnecessary subprocess overhead
         idle_sec = time.time() - float(_last_status_demand_ts or 0)
         if idle_sec > _STATUS_WARMUP_IDLE_GRACE_SEC:
             continue
@@ -348,9 +348,9 @@ def _load_auth_token() -> Optional[str]:
 
 def _tcp_probe_openclaw() -> Tuple[bool, Optional[int]]:
     """
-    TCP 端口探测 OpenClaw 是否存活。
-    极简实现：1-3ms 完成，无子进程，无 HTTP 开销。
-    返回: (是否可达, 延迟毫秒)
+    TCP port probe to check if OpenClaw is alive.
+    Minimal implementation: completes in 1-3ms, no subprocess, no HTTP overhead.
+    Returns: (is_reachable, latency_ms)
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -365,7 +365,7 @@ def _tcp_probe_openclaw() -> Tuple[bool, Optional[int]]:
 
 
 def _refresh_tcp_probe() -> Dict[str, Any]:
-    """执行 TCP 探测并更新缓存。"""
+    """Execute TCP probe and update cache."""
     reachable, latency_ms = _tcp_probe_openclaw()
     
     result = {
@@ -381,16 +381,16 @@ def _refresh_tcp_probe() -> Dict[str, Any]:
 
 
 def _get_tcp_probe_status() -> Dict[str, Any]:
-    """获取 TCP 探测状态（优先缓存，必要时刷新）。"""
+    """Get TCP probe status (prefer cache, refresh if needed)."""
     with _tcp_probe_lock:
         cached = dict(_tcp_probe_cache)
-    
+
     now = time.time()
-    # 缓存有效直接返回
+    # Return directly if cache is valid
     if now - cached.get("ts", 0) < _TCP_PROBE_CACHE_TTL_SEC:
         return cached
-    
-    # 缓存过期，执行探测
+
+    # Cache expired, execute probe
     return _refresh_tcp_probe()
 
 
@@ -419,28 +419,28 @@ def _require_auth(required_token: Optional[str]):
 
 
 def _read_last_jsonl_obj(path: Path) -> Optional[Dict[str, Any]]:
-    """mmap 快速读取最后 4KB，避免加载整个大文件"""
+    """mmap fast read last 4KB to avoid loading entire large file"""
     if not path.exists() or not path.is_file():
         return None
     try:
         with open(path, "rb") as f:
-            # 尝试用 mmap 读取
+            # Try mmap read
             try:
                 size = os.fstat(f.fileno()).st_size
                 if size == 0:
                     return None
-                # 大文件只读最后 4KB
+                # Large file: only read last 4KB
                 if size > 4096:
                     f.seek(size - 4096)
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    # 找到最后一行
+                    # Find last line
                     data = mm.read()
                     lines = data.decode("utf-8", errors="replace").strip().splitlines()
                     if not lines:
                         return None
                     return json.loads(lines[-1])
             except Exception:
-                # mmap 失败回退到普通读取
+                # mmap failed, fallback to normal read
                 f.seek(0)
                 lines = [ln.strip() for ln in f.readlines() if ln.strip()]
                 return json.loads(lines[-1]) if lines else None
@@ -448,7 +448,7 @@ def _read_last_jsonl_obj(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-# inotify 实时监控配置
+# inotify real-time monitoring config
 _WATCHED_FILES: Dict[str, str] = {
     str(CRON_JOBS_PATH): "crons",
     str(SUBAGENT_RUNS_PATH): "subagents",
@@ -460,29 +460,29 @@ _inotify_fd: Optional[int] = None
 
 
 def _init_inotify() -> bool:
-    """初始化 inotify 监控（仅 Linux）"""
+    """Initialize inotify monitoring (Linux only)"""
     global _inotify_initialized, _inotify_fd
     if _inotify_initialized:
         return _inotify_fd is not None
-    
+
     _inotify_initialized = True
-    
-    # 检查是否支持 inotify
+
+    # Check if inotify is supported
     try:
         import ctypes
         libc = ctypes.CDLL('libc.so.6', use_errno=True)
-        
-        # inotify_init1 标志
+
+        # inotify_init1 flags
         IN_CLOEXEC = 0x80000
         IN_NONBLOCK = 0x800
-        
+
         fd = libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
         if fd < 0:
             return False
-        
+
         _inotify_fd = fd
-        
-        # 监控文件修改（IN_MODIFY = 0x00000002）
+
+        # Monitor file modifications (IN_MODIFY = 0x00000002)
         IN_MODIFY = 0x00000002
         
         for filepath, name in _WATCHED_FILES.items():
@@ -497,22 +497,22 @@ def _init_inotify() -> bool:
 
 
 def _check_inotify_events(timeout_sec: float = 0.0) -> Set[str]:
-    """检查文件变化事件，非阻塞"""
+    """Check file change events, non-blocking"""
     if _inotify_fd is None:
         return set()
-    
+
     changed: Set[str] = set()
-    
+
     try:
         import ctypes
         import select
-        
-        # 非阻塞检查是否有事件
+
+        # Non-blocking check for events
         readable, _, _ = select.select([_inotify_fd], [], [], timeout_sec)
         if not readable:
             return changed
         
-        # 读取事件（inotify_event 结构）
+        # Read events (inotify_event structure)
         buf = os.read(_inotify_fd, 4096)
         offset = 0
         
@@ -537,21 +537,21 @@ def _check_inotify_events(timeout_sec: float = 0.0) -> Set[str]:
 
 
 def _invalidate_cache_by_type(cache_type: str) -> None:
-    """根据变化类型使缓存失效"""
+    """Invalidate cache by change type"""
     global _dash_cache, _status_cache, _models_cache, _memory_cache
-    
+
     now = time.time()
-    
+
     if cache_type == "crons":
-        # Cron 变化只刷新 dashboard
+        # Cron changes only refresh dashboard
         with _dash_lock:
             _dash_cache["ts"] = 0
     elif cache_type == "subagents":
-        # Subagent 变化刷新 dashboard
+        # Subagent changes refresh dashboard
         with _dash_lock:
             _dash_cache["ts"] = 0
     elif cache_type == "config":
-        # 配置变化影响所有
+        # Config changes affect all caches
         with _dash_lock:
             _dash_cache["ts"] = 0
         with _status_lock:
@@ -563,14 +563,14 @@ def _invalidate_cache_by_type(cache_type: str) -> None:
 
 
 def _start_inotify_monitor() -> None:
-    """启动 inotify 监控线程（事件驱动，零轮询）"""
+    """Start inotify monitoring thread (event-driven, zero polling)"""
     if not _init_inotify():
-        return  # 不支持 inotify，静默回退到轮询
-    
+        return  # inotify not supported, silently fallback to polling
+
     def _monitor_loop():
         while True:
             try:
-                # 等待事件（阻塞，但零 CPU）
+                # Wait for events (blocking, but zero CPU)
                 changed = _check_inotify_events(timeout_sec=1.0)
                 for cache_type in changed:
                     _invalidate_cache_by_type(cache_type)
@@ -784,9 +784,9 @@ def _current_agent_model(agent_id: str, status_agent: Optional[Dict[str, Any]] =
 
 
 def _restart_openclaw() -> Tuple[bool, str]:
-    """尝试重启 openclaw 服务。依次尝试 systemctl --user → openclaw restart。
-    返回 (success, method_used)。"""
-    # 1. 尝试 systemctl user service
+    """Try to restart openclaw service. Attempts systemctl --user then openclaw restart.
+    Returns (success, method_used)."""
+    # 1. Try systemctl user service
     for svc in ("openclaw.service", "openclaw"):
         try:
             proc = subprocess.run(
@@ -796,11 +796,11 @@ def _restart_openclaw() -> Tuple[bool, str]:
             if proc.returncode == 0:
                 return True, f"systemctl --user restart {svc}"
         except FileNotFoundError:
-            break  # systemctl 不存在，跳过后续 systemctl 尝试
+            break  # systemctl not found, skip subsequent systemctl attempts
         except subprocess.TimeoutExpired:
             pass
 
-    # 2. 尝试 openclaw restart 命令
+    # 2. Try openclaw restart command
     openclaw_bin = (
         os.environ.get("OPENCLAW_BIN")
         or shutil.which("openclaw")
@@ -950,7 +950,7 @@ def _actual_consumed_tokens(input_tokens: Any, output_tokens: Any, cache_read_to
     gross_input = max(0, _safe_int(input_tokens))
     cache_reused = max(0, _safe_int(cache_read_tokens))
     output = max(0, _safe_int(output_tokens))
-    # 实际消耗 Token = (总输入 Token − 缓存复用 Token) + 输出 Token
+    # Actual consumed tokens = (total input tokens - cache reused tokens) + output tokens
     return max(0, gross_input - cache_reused) + output
 
 
@@ -1045,7 +1045,7 @@ def _scan_usage_jsonl(path: Path, start_offset: int, day_keys: set[str]) -> Tupl
                 offset = 0
 
             f.seek(offset)
-            # 从中间偏移读取时，先丢弃首个残行，避免 JSON 解析噪声
+            # When reading from middle offset, discard first partial line to avoid JSON parse noise
             if offset > 0:
                 _ = f.readline()
 
@@ -1150,8 +1150,8 @@ def _build_session_file_passive_map() -> Dict[str, bool]:
                 except Exception:
                     pass
 
-            # 回填：sessionFile 缺失（或 sessionFile 与 sessionId 不一致）时，
-            # 基于 sessionId/session_key(UUID) 推导默认 jsonl 路径。
+            # Backfill: when sessionFile is missing (or sessionFile doesn't match sessionId),
+            # derive default jsonl path from sessionId/session_key(UUID).
             session_uuid = str(rec.get("sessionId") or rec.get("session_id") or "").strip()
             if not _looks_like_uuid(session_uuid):
                 session_uuid = _uuid_from_session_key(rec.get("sessionKey") or rec.get("session_key") or session_key)
@@ -1256,7 +1256,7 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
 
         file_state.pop(fp, None)
 
-    # 增量模式下：文件被删除时先回滚其历史贡献
+    # In incremental mode: rollback historical contribution when file is deleted
     if incremental_mode:
         stale_paths = [fp for fp in list(file_contrib.keys()) if fp not in live_paths]
         for fp in stale_paths:
@@ -1272,11 +1272,11 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
         try:
             st = p.stat()
         except Exception:
-            # 文件在 filelist 之后被删除/轮转：立即回滚旧贡献，避免历史日 overcount 悬挂。
+            # File deleted/rotated after filelist: immediately rollback old contribution to avoid overcount.
             _rollback_file_contrib(fp)
             continue
 
-        # 初次构建时，跳过明显不在窗口内的历史文件
+        # On initial build, skip historical files clearly outside the window
         if not incremental_mode:
             try:
                 if datetime.fromtimestamp(st.st_mtime).date() < start_day:
@@ -1305,7 +1305,7 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
             start_offset = old_offset
             end_offset, add_map = _scan_usage_jsonl(p, start_offset, day_keys)
             if end_offset == 0 and size > 0:
-                # 扫描失败时不更新已有状态，避免脏数据覆盖
+                # On scan failure, don't update existing state to avoid dirty data overwrite
                 continue
 
             merged = {k: int(v or 0) for k, v in prev_contrib.items()}
@@ -1332,12 +1332,12 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
             }
             continue
 
-        # 非增量路径（新文件/轮转/截断）：先回滚旧贡献，再全量重扫该文件
+        # Non-incremental path (new file/rotation/truncation): rollback old contribution, then full rescan
         _rollback_file_contrib(fp)
 
         end_offset, full_map = _scan_usage_jsonl(p, 0, day_keys)
         if end_offset == 0 and size > 0:
-            # 重扫失败时保持“已回滚且缓存已清理”状态，避免悬挂 overcount
+            # On rescan failure, keep “rolled back and cache cleared” state to avoid hanging overcount
             continue
 
         full_map = {k: int(v or 0) for k, v in full_map.items()}
@@ -1361,7 +1361,7 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
             "mtimeNs": mtime_ns,
         }
 
-    # 防御：避免异常回滚导致负值
+    # Defense: prevent negative values from abnormal rollback
     for k in list(day_map.keys()):
         day_map[k] = max(0, int(day_map.get(k, 0)))
         day_active_map[k] = max(0, int(day_active_map.get(k, 0)))
@@ -1574,7 +1574,7 @@ def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
         row.pop("_activeSessionSet", None)
         row.pop("_passiveSessionSet", None)
 
-    # 补齐“已配置但未使用”的模型
+    # Fill in “configured but unused” models
     for model_id, meta in configured_models.items():
         usage.setdefault(
             model_id,
@@ -1598,7 +1598,7 @@ def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
 
     rows = sorted(usage.values(), key=lambda r: r.get("tokens", 0), reverse=True)
 
-    # 每日累计处理量：与模型明细使用同一窗口，避免展示口径不一致
+    # Daily cumulative usage: use same window as model details for consistent display
     daily_rows = _collect_daily_token_series(days)
 
     payload = {
@@ -1610,7 +1610,7 @@ def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
         "activeSessions": int(len(active_session_set)),
         "passiveSessions": int(len(passive_session_set)),
         "windowDays": int(days),
-        "formula": "实际消耗 Token = 净输入 + 输出；净输入 = max(0, 输入 - 缓存复用)（按每次模型调用逐条统计）",
+        "formula": "Actual consumed tokens = net input + output; net input = max(0, input - cache reused) (per model call)",
         "models": rows,
         "dailyTokens": daily_rows,
     }
@@ -1691,7 +1691,7 @@ def _collect_memory_data(
 
     topic_files: List[Path] = []
     if topics_dir.exists():
-        # 限制扫描：最多50个文件
+        # Limit scan: max 50 files
         topic_count = 0
         for f in topics_dir.rglob("*.md"):
             if "_legacy_" in str(f):
@@ -1699,7 +1699,7 @@ def _collect_memory_data(
             if f.is_file():
                 topic_files.append(f)
                 topic_count += 1
-                if topic_count >= 50:  # 限制文件数
+                if topic_count >= 50:  # Limit file count
                     break
 
     memories_md_files = [f for f in memories_md_dir.glob("*.md") if f.is_file()] if memories_md_dir.exists() else []
@@ -1728,14 +1728,14 @@ def _collect_memory_data(
     lancedb_size = 0
     lancedb_dir = memory_root / "lancedb-pro"
     if lancedb_dir.exists():
-        # 限制扫描：最多100个文件，避免大目录卡顿
+        # Limit scan: max 100 files to avoid large directory slowdown
         file_count = 0
         for f in lancedb_dir.rglob("*"):
             if f.is_file():
                 try:
                     lancedb_size += int(f.stat().st_size)
                     file_count += 1
-                    if file_count >= 100:  # 限制文件数
+                    if file_count >= 100:  # Limit file count
                         break
                 except Exception:
                     pass
@@ -1781,36 +1781,31 @@ def _collect_memory_data(
         if "memory" in low or "memory-central" in low or "memory" in payload_text:
             automation_rows.append(
                 {
-                    **_job_row(j, "通过定时任务维护、提炼或使用 memory 数据。"),
+                    **_job_row(j, "Maintain, refine, or use memory data via scheduled task."),
                     "scheduleText": schedule_text,
                     "currentModel": current_model,
                 }
             )
 
         if (
-            "自我升级" in name
-            or "evolver" in low
-            or "进化" in name
-            or "memory-central治理" in name
+            "evolver" in low
             or "memory-central" in low
         ):
             self_improve_rows.append(
                 _job_row(
                     j,
-                    "推动 memory 规则沉淀与索引治理（写入 central topics，append-only）。",
+                    "Drive memory rule sedimentation and index governance (write to central topics, append-only).",
                 )
             )
 
         if (
-            "监督" in name
-            or "review" in low
-            or "介入" in name
+            "review" in low
             or "involve" in low
         ):
             involve_rows.append(
                 _job_row(
                     j,
-                    "推动介入流程规则沉淀（触发词/播报规范/退出条件等）。",
+                    "Drive intervention process rule sedimentation (trigger words/broadcast specs/exit conditions).",
                 )
             )
 
@@ -1841,10 +1836,10 @@ def _collect_memory_data(
         slot_enabled = bool(slot_entry.get("enabled")) if isinstance(slot_entry, dict) else False
         _append_capability(
             f"slot:{memory_slot}",
-            f"活动 Memory 插槽: {memory_slot}",
+            f"Active Memory Slot: {memory_slot}",
             "config",
             "active" if slot_enabled else "configured",
-            "当前 memory 插槽来自 openclaw.json 配置。",
+            "Current memory slot from openclaw.json config.",
             [f"plugins.slots.memory = {memory_slot}"],
         )
 
@@ -1858,7 +1853,7 @@ def _collect_memory_data(
             plugin_id,
             "config",
             "active" if enabled else "available",
-            "插件条目存在于 openclaw.json。" if enabled else "插件已配置，但当前未启用。",
+            "Plugin entry exists in openclaw.json." if enabled else "Plugin configured but not enabled.",
             [f"plugins.entries.{plugin_id}.enabled = {str(enabled).lower()}"],
         )
 
@@ -1870,7 +1865,7 @@ def _collect_memory_data(
             "session-memory hook",
             "config",
             "active" if enabled else "available",
-            "内部 hook 会在会话层处理记忆沉淀。",
+            "Internal hook handles memory sedimentation at session level.",
             [f"hooks.internal.entries.session-memory.enabled = {str(enabled).lower()}"],
         )
 
@@ -1880,7 +1875,7 @@ def _collect_memory_data(
             "memory-central",
             "filesystem",
             "active",
-            f"集中记忆中心已存在，包含 {len(topic_files)} 个 topic 与 {len(memories_md_files)} 个 memories-md 文件。",
+            f"Central memory hub exists with {len(topic_files)} topics and {len(memories_md_files)} memories-md files.",
             [str(central_dir)],
         )
 
@@ -1890,7 +1885,7 @@ def _collect_memory_data(
             "workspace memory",
             "filesystem",
             "active",
-            f"检测到 {len(workspace_rows)} 个工作区 memory 目录，共 {total_entries} 条 Markdown 记忆。",
+            f"Detected {len(workspace_rows)} workspace memory directories with {total_entries} Markdown memories.",
             [str(OPENCLAW_DIR / 'workspace')],
         )
 
@@ -1900,7 +1895,7 @@ def _collect_memory_data(
             "SQLite memory store",
             "filesystem",
             "active",
-            f"检测到 {len(sqlite_files)} 个 SQLite 记忆库，合计 {_sum_size(sqlite_files)} 字节。",
+            f"Detected {len(sqlite_files)} SQLite memory stores, total {_sum_size(sqlite_files)} bytes.",
             [str(memory_root)],
         )
 
@@ -1910,7 +1905,7 @@ def _collect_memory_data(
             "LanceDB data store",
             "filesystem",
             "active",
-            f"检测到 LanceDB 数据目录，体积 {lancedb_size} 字节。该项仅说明现有向量数据仍在磁盘上。",
+            f"Detected LanceDB data directory, size {lancedb_size} bytes. Indicates existing vector data on disk.",
             [str(lancedb_dir)],
         )
 
@@ -1920,7 +1915,7 @@ def _collect_memory_data(
             "memory backups",
             "filesystem",
             "active",
-            f"检测到 {len(backup_files)} 个 memory backup 文件。",
+            f"Detected {len(backup_files)} memory backup files.",
             [str(backups_dir)],
         )
 
@@ -1930,7 +1925,7 @@ def _collect_memory_data(
             "memory-related crons",
             "runtime",
             "active",
-            f"检测到 {len(automation_rows)} 个与 memory 相关的启用 cron。",
+            f"Detected {len(automation_rows)} memory-related enabled crons.",
             [CRON_JOBS_PATH.as_posix()],
         )
 
@@ -1979,8 +1974,8 @@ def _extract_unfinished_goals_for_job(job: Dict[str, Any], content_text: str) ->
     goals: List[str] = []
     text_lc = (content_text or "").lower()
 
-    # 针对监督类任务，补充 monitor-state.json 中的未完成项
-    if "monitor-state" in text_lc or "监督" in str(job.get("name") or ""):
+    # For review tasks, supplement with unfinished items from monitor-state.json
+    if "monitor-state" in text_lc:
         monitor_path = OPENCLAW_DIR / "workspace-review_agent" / "monitor-state.json"
         m = _safe_read_json(monitor_path, {})
         issues = m.get("openIssues", []) if isinstance(m, dict) else []
@@ -1992,7 +1987,7 @@ def _extract_unfinished_goals_for_job(job: Dict[str, Any], content_text: str) ->
                 pending = bool(it.get("pendingNeverAction", False))
                 if st in {"open", "todo", "pending", "in_progress"} or pending:
                     goals.append(
-                        f"- [{it.get('id') or 'issue'}] {it.get('description') or ''}（动作：{it.get('action') or '-'}）"
+                        f"- [{it.get('id') or 'issue'}] {it.get('description') or ''} (action: {it.get('action') or '-'})"
                     )
 
     return goals
@@ -2019,14 +2014,14 @@ def _build_cron_monitor_text(job: Dict[str, Any]) -> str:
             except Exception:
                 msg = str(payload)
         else:
-            msg = "该任务未配置具体工作内容。"
+            msg = "This task has no configured work content."
 
     goals = _extract_unfinished_goals_for_job(job, msg)
 
     if goals:
-        goal_text = "\n\n当前未完成目标:\n" + "\n".join(goals)
+        goal_text = "\n\nCurrent unfinished goals:\n" + "\n".join(goals)
     else:
-        goal_text = "\n\n当前未完成目标:\n- 无"
+        goal_text = "\n\nCurrent unfinished goals:\n- None"
 
     txt = f"{msg}{goal_text}"
     return txt[:7000]
@@ -2043,14 +2038,14 @@ def _humanize_cron_expr(expr: str, tz: str = "") -> str:
 
     minute, hour, dom, month, dow = parts
     dow_map = {
-        "0": "周日",
-        "1": "周一",
-        "2": "周二",
-        "3": "周三",
-        "4": "周四",
-        "5": "周五",
-        "6": "周六",
-        "7": "周日",
+        "0": "Sun",
+        "1": "Mon",
+        "2": "Tue",
+        "3": "Wed",
+        "4": "Thu",
+        "5": "Fri",
+        "6": "Sat",
+        "7": "Sun",
     }
 
     def _fmt_hm(h: str, m: str) -> Optional[str]:
@@ -2061,20 +2056,20 @@ def _humanize_cron_expr(expr: str, tz: str = "") -> str:
     label: Optional[str] = None
     hm = _fmt_hm(hour, minute)
     if dom == "*" and month == "*" and dow == "*" and hm:
-        label = f"每天 {hm}"
+        label = f"Daily {hm}"
     elif dom == "*" and month == "*" and dow in dow_map and hm:
         label = f"{dow_map[dow]} {hm}"
     elif dom == "*" and month == "*" and hour == "*" and minute.startswith("*/"):
-        label = f"每{minute[2:]}分钟"
+        label = f"Every {minute[2:]} min"
     elif dom == "*" and month == "*" and minute.isdigit() and hour.startswith("*/"):
-        label = f"每{hour[2:]}小时 {int(minute):02d}分"
+        label = f"Every {hour[2:]}h at :{int(minute):02d}"
     elif dom == "*" and month == "*" and dow == "*" and minute.isdigit() and hour == "*":
-        label = f"每小时 {int(minute):02d}分"
+        label = f"Hourly at :{int(minute):02d}"
     elif dom.isdigit() and month == "*" and dow == "*" and hm:
-        label = f"每月{int(dom)}日 {hm}"
+        label = f"Monthly {int(dom)}th {hm}"
 
     if label:
-        return f"{label}（{tz}）" if tz else label
+        return f"{label} ({tz})" if tz else label
     return f"{expr} ({tz})" if tz else expr
 
 
@@ -2098,12 +2093,12 @@ def _describe_schedule(schedule: Any) -> str:
             return "every"
         total_sec = max(1, every_ms // 1000)
         if total_sec % 86400 == 0:
-            return f"每{total_sec // 86400}天"
+            return f"Every {total_sec // 86400} day(s)"
         if total_sec % 3600 == 0:
-            return f"每{total_sec // 3600}小时"
+            return f"Every {total_sec // 3600} hour(s)"
         if total_sec % 60 == 0:
-            return f"每{total_sec // 60}分钟"
-        return f"每{total_sec}秒"
+            return f"Every {total_sec // 60} min"
+        return f"Every {total_sec}s"
 
     if kind == "cron":
         expr = str(schedule.get("expr") or "").strip() or "-"
@@ -2116,39 +2111,39 @@ def _describe_schedule(schedule: Any) -> str:
     return kind or "-"
 
 
-# Cron run files 缓存
+# Cron run files cache
 _cron_run_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
-_cron_run_cache_ttl_sec = 5  # 5秒缓存
+_cron_run_cache_ttl_sec = 5  # 5 second cache
 
 
 def _prefetch_cron_run_files(jobs: List[Dict[str, Any]]) -> None:
-    """预读取 cron run 文件，利用 mtime 避免重复读取未变更的文件"""
+    """Prefetch cron run files, use mtime to avoid re-reading unchanged files"""
     global _cron_run_cache
-    
+
     now = time.time()
-    
+
     for job in jobs:
         if not isinstance(job, dict):
             continue
         job_id = str(job.get("id") or "")
         if not job_id:
             continue
-        
+
         run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
         cache_key = str(run_file)
-        
-        # 检查缓存是否有效
+
+        # Check if cache is valid
         cached = _cron_run_cache.get(cache_key)
         if cached:
             cached_time, _ = cached
             if now - cached_time < _cron_run_cache_ttl_sec:
-                continue  # 缓存有效，跳过
-        
-        # 检查文件 mtime
+                continue  # Cache valid, skip
+
+        # Check file mtime
         try:
             if run_file.exists():
                 mtime = run_file.stat().st_mtime
-                # 如果文件未变更，只更新时间戳
+                # If file unchanged, only update timestamp
                 if cached and mtime <= cached_time:
                     _cron_run_cache[cache_key] = (now, cached[1])
                     continue
@@ -2167,9 +2162,9 @@ def _collect_cron_data() -> Dict[str, Any]:
     total_jobs = 0
     agent_ids: List[str] = []
 
-    # 批量预读 run files（减少 IO 次数）
+    # Batch prefetch run files (reduce IO)
     _prefetch_cron_run_files(jobs)
-    
+
     for job in jobs:
         if not isinstance(job, dict):
             continue
@@ -2179,7 +2174,7 @@ def _collect_cron_data() -> Dict[str, Any]:
             continue
         enabled_total += 1
         job_id = str(job.get("id") or "")
-        
+
         state = job.get("state", {}) if isinstance(job.get("state"), dict) else {}
         last_status_raw = state.get("lastStatus") or state.get("lastRunStatus") or "-"
         last_status = str(last_status_raw or "").strip().lower()
@@ -2187,15 +2182,15 @@ def _collect_cron_data() -> Dict[str, Any]:
         active_status = {"running", "started", "processing", "in_progress", "pending", "queued"}
         terminal_status = {"completed", "complete", "success", "succeeded", "ok", "failed", "error", "cancelled", "canceled", "skipped", "timeout", "timed_out", "done"}
 
-        # 优先使用 jobs.json 中的状态，减少 jsonl 读取
+        # Prefer status from jobs.json to reduce jsonl reads
         if last_status in active_status:
             is_running = True
-            last_event = None  # 不需要读 jsonl
+            last_event = None  # No need to read jsonl
         elif last_status in terminal_status:
             is_running = False
-            last_event = None  # 不需要读 jsonl
+            last_event = None  # No need to read jsonl
         else:
-            # 状态不明确时才读取 jsonl
+            # Only read jsonl when status is unclear
             is_running = False
             run_file = CRON_RUNS_DIR / f"{job_id}.jsonl"
             last_event = _read_last_jsonl_obj(run_file)
@@ -2254,7 +2249,7 @@ def _get_cron_monitor_text(job_id: str) -> str:
             continue
         if str(job.get("id") or "") == str(job_id):
             return _build_cron_monitor_text(job)
-    return "未找到该任务，可能已被删除或重命名。"
+    return "Task not found, may have been deleted or renamed."
 
 
 def _build_channels_from_status(status_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2283,26 +2278,26 @@ def _build_channels_from_status(status_data: Dict[str, Any]) -> List[Dict[str, A
 
 def _check_agent_running_via_fs(agent_id: str) -> Tuple[bool, Optional[int]]:
     """
-    极速检测 Agent 运行状态。
-    使用 os.scandir 直接读取目录，避免 glob 开销。
-    返回: (是否运行中, 最后活跃毫秒数)
+    Fast detection of Agent running status.
+    Uses os.scandir to directly read directory, avoiding glob overhead.
+    Returns: (is_running, last_active_ms)
     """
     global _agent_fs_cache
-    
+
     now = time.time()
-    
-    # 检查缓存
+
+    # Check cache
     with _agent_fs_cache_lock:
         cached = _agent_fs_cache.get(agent_id)
         if cached:
             cached_time, cached_running, cached_age = cached
             if now - cached_time < _agent_fs_cache_ttl_sec:
                 return cached_running, cached_age
-    
+
     sessions_dir = AGENTS_DIR / agent_id / "sessions"
-    
+
     try:
-        # 使用 os.scandir 极速扫描（比 glob 快 2-5 倍）
+        # Use os.scandir for fast scan (2-5x faster than glob)
         latest_mtime = 0.0
         with os.scandir(sessions_dir) as it:
             for entry in it:
@@ -2353,13 +2348,13 @@ def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any])
             continue
         aid = str(a.get("id") or "")
         
-        # 优先使用文件系统实时检测（更快）
+        # Prefer filesystem real-time detection (faster)
         fs_running, fs_age_ms = _check_agent_running_via_fs(aid)
-        
-        # 也参考 status 数据（作为备份）
+
+        # Also reference status data (as backup)
         status_age_ms = a.get("lastActiveAgeMs")
-        
-        # 取更小的 age（更准确的活跃时间）
+
+        # Take smaller age (more accurate active time)
         if fs_age_ms is not None and status_age_ms is not None:
             effective_age_ms = min(fs_age_ms, status_age_ms)
             agent_running = fs_running or (isinstance(status_age_ms, (int, float)) and status_age_ms <= ACTIVE_AGENT_WINDOW_MS)
@@ -2419,15 +2414,15 @@ def _collect_agents_data(status_data: Dict[str, Any], subagents: Dict[str, Any])
 
 def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err: Optional[str]) -> Dict[str, Any]:
     """
-    汇总 OpenClaw 状态。
-    使用 TCP 端口探测（1-3ms）快速判断服务是否在线，再结合 openclaw status 的详细数据。
+    Summarize OpenClaw status.
+    Uses TCP port probe (1-3ms) for quick online check, combined with openclaw status details.
     """
-    # TCP 端口探测（1-3ms 完成）
+    # TCP port probe (completes in 1-3ms)
     tcp_probe = _get_tcp_probe_status()
     tcp_reachable = tcp_probe.get("reachable", False)
     tcp_latency_ms = tcp_probe.get("latencyMs")
-    
-    # 如果没有状态数据，用 TCP 探测结果决定
+
+    # If no status data, use TCP probe result
     if not status_data:
         if tcp_reachable:
             return {
@@ -2465,10 +2460,10 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
     critical = int((security.get("summary") or {}).get("critical") or 0)
     warns = int((security.get("summary") or {}).get("warn") or 0)
 
-    # 优先使用 TCP 探测结果判断可达性（更快更准）
+    # Prefer TCP probe result for reachability (faster and more accurate)
     gateway_reachable = tcp_reachable if tcp_reachable else bool(gateway.get("reachable", False))
-    
-    # 使用 TCP 探测的延迟（如果有）
+
+    # Use TCP probe latency if available
     effective_latency_ms = tcp_latency_ms if tcp_latency_ms is not None else gateway.get("connectLatencyMs")
     
     runtime_short = str(gateway_service.get("runtimeShort") or "")
@@ -2484,7 +2479,7 @@ def _collect_openclaw_summary(status_data: Optional[Dict[str, Any]], status_err:
         "deactivating",
     )
 
-    # 3 态：正常 / 重启 / 离线
+    # 3 states: Online / Restarting / Offline
     if any(sig in runtime_lc for sig in restarting_signals):
         state = "Restarting"
     elif service_running or gateway_reachable or tcp_reachable:
@@ -2644,7 +2639,7 @@ def _empty_dashboard_payload() -> Dict[str, Any]:
             "passiveTokens": 0,
             "activeSessions": 0,
             "passiveSessions": 0,
-            "formula": "实际消耗 Token = 净输入 + 输出；净输入 = max(0, 输入 - 缓存复用)",
+            "formula": "Actual consumed = net input + output; net input = max(0, input - cache reused)",
             "models": [],
             "dailyTokens": [],
         },
@@ -2691,23 +2686,23 @@ def _get_dashboard_payload() -> Dict[str, Any]:
         cached = _dash_cache.get("data")
         cached_ts = float(_dash_cache.get("ts", 0) or 0)
 
-    # 首次无缓存：立即返回占位数据，后台异步构建，保证“秒开”体感
+    # First time no cache: return placeholder data, build async in background for instant load
     if cached is None:
         _start_dashboard_refresh()
         return _empty_dashboard_payload()
 
-    # 缓存命中：直接返回
+    # Cache hit: return directly
     if now - cached_ts < _DASH_CACHE_TTL_SEC:
         return cached
 
-    # 缓存过期：返回旧数据并异步刷新，避免请求阻塞
+    # Cache expired: return stale data and async refresh to avoid blocking
     _start_dashboard_refresh()
     return cached
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    # Never 要求：页面开箱即用，不需要任何 token 输入
+    # Requirement: page works out of box, no token input needed
     required_token = None
 
     @app.after_request
@@ -2717,16 +2712,16 @@ def create_app() -> Flask:
         resp.headers["Expires"] = "0"
         return resp
 
-    # 后台预热 openclaw status，避免 API 首次请求卡住
+    # Background warmup openclaw status to avoid first API request blocking
     global _bg_warmup_started
     if not _bg_warmup_started:
         t = threading.Thread(target=_bg_status_warmup_loop, daemon=True, name="clawstatus-warmup")
         t.start()
-        # 启动 inotify 事件监控（零轮询，Linux only）
+        # Start inotify event monitoring (zero polling, Linux only)
         _start_inotify_monitor()
         _bg_warmup_started = True
 
-    # 仪表盘数据预热（异步），避免首次接口阻塞
+    # Dashboard data warmup (async) to avoid first request blocking
     _start_dashboard_refresh()
 
     @app.get("/")
@@ -2736,7 +2731,7 @@ def create_app() -> Flask:
     @app.get("/api/auth/check")
     def api_auth_check():
         valid = _is_authorized(required_token)
-        # 未配置 token 时视为 valid
+        # Treat as valid when no token configured
         if not required_token:
             valid = True
         return jsonify(
@@ -2895,7 +2890,7 @@ def create_app() -> Flask:
         out["_sourceTimestamps"] = data.get("sourceTimestamps", {})
         return jsonify(out)
 
-    # ---- 兼容旧 API（供现有脚本/测试使用） ----
+    # ---- Legacy API compatibility (for existing scripts/tests) ----
     @app.get("/api/health")
     def api_health():
         auth_resp = _require_auth(required_token)
@@ -3524,17 +3519,17 @@ def _index_html(auth_token: Optional[str] = None) -> str:
     const VALID_PAGES = new Set(['overview', 'flow', 'crons', 'usage', 'memory']);
     let activePage = 'overview';
 
-    // 自动刷新配置 - 简洁高效
+    // Auto-refresh config - simple and efficient
     const refreshState = {{
-      overview: {{ url: '/api/overview', interval: 5, next: 0, page: 'overview' }},      // 5秒 - 核心概览
-      openclaw: {{ url: '/api/openclaw', interval: 10, next: 0, page: 'overview' }},     // 10秒 - 服务状态
-      agents: {{ url: '/api/agents', interval: 3, next: 0, page: 'overview' }},          // 3秒 - Agent实时状态
-      crons: {{ url: '/api/crons', interval: 10, next: 0, page: 'crons' }},              // 10秒 - Cron任务
-      models: {{ url: '/api/models', interval: 60, next: 0, page: 'usage' }},            // 60秒 - 模型统计（低频）
-      memory: {{ url: '/api/memory', interval: 30, next: 0, page: 'memory' }},           // 30秒 - 内存数据
+      overview: {{ url: '/api/overview', interval: 5, next: 0, page: 'overview' }},      // 5s - core overview
+      openclaw: {{ url: '/api/openclaw', interval: 10, next: 0, page: 'overview' }},     // 10s - service status
+      agents: {{ url: '/api/agents', interval: 3, next: 0, page: 'overview' }},          // 3s - Agent real-time status
+      crons: {{ url: '/api/crons', interval: 10, next: 0, page: 'crons' }},              // 10s - Cron tasks
+      models: {{ url: '/api/models', interval: 60, next: 0, page: 'usage' }},            // 60s - model stats (low freq)
+      memory: {{ url: '/api/memory', interval: 30, next: 0, page: 'memory' }},           // 30s - memory data
     }};
 
-    // 刷新速度档位（倍数作用于基础间隔）
+    // Refresh speed tiers (multiplier on base interval)
     const SPEED_KEY = 'clawstatus-speed';
     const SPEED_MULT = {{ fastest: 0.3, fast: 0.6, medium: 1, slow: 2 }};
     let currentSpeed = localStorage.getItem(SPEED_KEY) || 'medium';
@@ -3700,7 +3695,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const initialPage = pageFromUrl();
       setActivePage(initialPage, {{ forceRefresh: true, replaceUrl: true }});
 
-      // 其他页数据按需加载（切换标签时触发）
+      // Other page data loaded on demand (triggered on tab switch)
     }}
 
     function render(d) {{
@@ -3851,7 +3846,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
           const jobId = btn.getAttribute('data-cron-id');
           const jobName = btn.getAttribute('data-cron-name') || jobId;
           
-          // 确认对话框
+          // Confirm dialog
           if (!confirm(`${{t('confirmDelete')}}\n\n${{jobName}}`)) {{
             return;
           }}
@@ -3868,7 +3863,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
             if (result && result.deleted) {{
               btn.textContent = '✓ ' + t('deleted');
               btn.style.color = 'var(--ok)';
-              // 立即刷新列表
+              // Refresh list immediately
               setTimeout(() => refreshOne('crons', true), 1000);
             }} else {{
               btn.textContent = t('deleteFailed');
@@ -4310,11 +4305,11 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       setActivePage(page, {{ forceRefresh: true, replaceUrl: true }});
     }});
 
-    // 启动自动刷新
+    // Start auto-refresh
     bootstrapRefresh();
     bindModelSwitchModal();
 
-    // 主刷新循环 - 每500ms检查一次，精准触发
+    // Main refresh loop - check every 500ms, precise triggering
     setInterval(() => {{
       if (document.hidden) return;
       
@@ -4457,7 +4452,7 @@ def _run_server(host: str, port: int, debug: bool) -> int:
 
 
 def _get_file_mtime(path: str) -> float:
-    """获取文件修改时间"""
+    """Get file modification time"""
     try:
         return os.path.getmtime(path)
     except Exception:
@@ -4466,30 +4461,30 @@ def _get_file_mtime(path: str) -> float:
 
 def _run_dev_mode(host: str, port: int) -> int:
     """
-    开发者模式：监控文件变化并自动重启。
-    使用子进程 + exec 实现无缝重启，保持简单零依赖。
+    Developer mode: monitor file changes and auto-restart.
+    Uses subprocess + exec for seamless restart, keeping it simple with zero dependencies.
     """
     import signal
     import subprocess
     import sys
-    
-    # 当前文件路径
+
+    # Current file path
     self_path = os.path.abspath(__file__)
-    
-    # 文件监控间隔（秒）
+
+    # File monitoring interval (seconds)
     check_interval = 1.0
-    
+
     print(f"[DEV] Starting in developer mode...")
     print(f"[DEV] Watching: {self_path}")
     print(f"[DEV] Server: http://{host}:{port}")
     print(f"[DEV] Press Ctrl+C to stop\n")
-    
-    # 记录启动时的文件修改时间
+
+    # Record file mtime at startup
     last_mtime = _get_file_mtime(self_path)
-    
-    # 启动子进程运行服务器
+
+    # Start subprocess to run server
     while True:
-        # 使用 subprocess 启动子进程
+        # Use subprocess to start child process
         cmd = [sys.executable, self_path, "--host", host, "--port", str(port), "--debug"]
         
         try:
@@ -4501,7 +4496,7 @@ def _run_dev_mode(host: str, port: int) -> int:
                 stdin=sys.stdin,
             )
             
-            # 监控循环
+            # Monitoring loop
             while proc.poll() is None:
                 time.sleep(check_interval)
                 
@@ -4515,7 +4510,7 @@ def _run_dev_mode(host: str, port: int) -> int:
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
-                    break  # 外层循环会重新启动
+                    break  # Outer loop will restart
                     
         except KeyboardInterrupt:
             print("\n[DEV] Stopping...")
@@ -4563,7 +4558,7 @@ def main() -> int:
         _cmd_stop()
         return _cmd_start(args.host, args.port, debug)
 
-    # 开发者模式：文件变化自动重启
+    # Developer mode: auto-restart on file changes
     if args.dev:
         return _run_dev_mode(args.host, args.port)
 
