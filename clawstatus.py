@@ -2794,6 +2794,15 @@ def create_app() -> Flask:
     # Dashboard data warmup (async) to avoid first request blocking
     _start_dashboard_refresh()
 
+    @app.get("/favicon.ico")
+    def favicon():
+        import os
+        favicon_path = os.path.join(os.path.dirname(__file__), "favicon.ico")
+        if os.path.exists(favicon_path):
+            with open(favicon_path, "rb") as f:
+                return Response(f.read(), mimetype="image/x-icon")
+        return Response(status=404)
+
     @app.get("/")
     def index() -> Response:
         return Response(_index_html(required_token), mimetype="text/html")
@@ -3050,6 +3059,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{APP_TITLE}</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <style>
     :root {{
       --bg: #05070d;
