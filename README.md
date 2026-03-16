@@ -4,14 +4,18 @@ A real-time monitoring dashboard for [OpenClaw](https://github.com/anthropics/Op
 
 ## Features
 
-- **Device Monitoring** - Track online status and health of all connected devices
-- **Agent Status** - Real-time visibility into running agents and subagents
-- **Session Management** - View active sessions with detailed statistics
-- **Cron Job Tracking** - Monitor scheduled tasks and their execution status
-- **Model Overview** - Display available models and their configurations
-- **Token Usage Analytics** - 15-day token consumption trends with daily breakdown
-- **Multi-language Support** - English and Chinese interface
+- **Real-time Device Monitoring** - Track online/offline status and health of all connected devices with TCP probe detection
+- **Agent & Subagent Tracking** - Real-time visibility into running agents, subagents, and their execution status
+- **Session Management** - View active sessions with detailed statistics and transcript history
+- **Cron Job Management** - Monitor scheduled tasks, view execution history, run jobs manually, and delete crons
+- **Model Configuration** - Display available models, switch models for agents/crons, and view configurations
+- **Token Usage Analytics** - 15-day token consumption trends with daily breakdown and archival data scanning
+- **System Health Monitoring** - Real-time system resource usage, memory status, and OpenClaw ecosystem health
+- **Channel Management** - View and manage communication channels with real-time status
+- **Configurable Refresh Rates** - Adjust dashboard refresh speed based on your needs
+- **Multi-language Support** - English and Chinese interface with full i18n support
 - **Single-file Deployment** - No complex dependencies, easy to deploy anywhere
+- **Zero-polling Architecture** - Uses inotify event monitoring on Linux for efficient resource usage
 
 ## Installation
 

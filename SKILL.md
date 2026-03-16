@@ -4,14 +4,18 @@ Real-time monitoring dashboard for OpenClaw ecosystem. Track devices, agents, se
 
 ## Features
 
-- Device monitoring with online/offline status
-- Agent and subagent real-time tracking
-- Session management with statistics
-- Cron job scheduling and execution monitoring
-- Model overview and configuration display
-- 15-day token usage analytics
-- English/Chinese interface
-- Single-file deployment
+- Real-time device monitoring with TCP probe detection
+- Agent and subagent real-time tracking with execution status
+- Session management with statistics and transcript history
+- Cron job scheduling, execution monitoring, manual run, and deletion
+- Model overview, configuration display, and model switching
+- 15-day token usage analytics with archival data scanning
+- System health monitoring and resource usage tracking
+- Channel management and communication status
+- Configurable refresh rates for dashboard updates
+- English/Chinese bilingual interface with full i18n support
+- Zero-polling architecture using inotify event monitoring
+- Single-file deployment with minimal dependencies
 
 ## Installation
 
