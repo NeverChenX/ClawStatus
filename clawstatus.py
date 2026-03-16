@@ -977,12 +977,16 @@ def _update_cron_model(job_id: str, model_id: str) -> Dict[str, Any]:
     }
 
 
-def _actual_consumed_tokens(input_tokens: Any, output_tokens: Any, cache_read_tokens: Any) -> int:
-    gross_input = max(0, _safe_int(input_tokens))
-    cache_reused = max(0, _safe_int(cache_read_tokens))
+def _actual_consumed_tokens(input_tokens: Any, output_tokens: Any,
+                            cache_read_tokens: Any, cache_write_tokens: Any = None) -> int:
+    net_input = max(0, _safe_int(input_tokens))
+    cache_write = max(0, _safe_int(cache_write_tokens))
     output = max(0, _safe_int(output_tokens))
-    # Actual consumed tokens = (total input tokens - cache reused tokens) + output tokens
-    return max(0, gross_input - cache_reused) + output
+    # OpenClaw usage format: `input` is already net (excludes cacheRead & cacheWrite).
+    # totalTokens = input + output + cacheRead + cacheWrite.
+    # Actual consumed = input + cacheWrite + output = totalTokens - cacheRead.
+    # cacheWrite tokens are freshly processed (billed at 1.25x), NOT from cache.
+    return net_input + cache_write + output
 
 
 def _is_passive_session(session_key: str, rec: Dict[str, Any]) -> bool:
@@ -1030,10 +1034,11 @@ def _usage_day_and_tokens_from_line(line: str, day_keys: set[str]) -> Optional[T
     input_tokens = usage.get("input")
     output_tokens = usage.get("output")
     cache_read = usage.get("cacheRead")
+    cache_write = usage.get("cacheWrite")
 
     has_formula_fields = any(v is not None for v in (input_tokens, output_tokens, cache_read))
     if has_formula_fields:
-        consumed = _actual_consumed_tokens(input_tokens, output_tokens, cache_read)
+        consumed = _actual_consumed_tokens(input_tokens, output_tokens, cache_read, cache_write)
     else:
         total_tokens = usage.get("totalTokens")
         consumed = _safe_int(total_tokens)
@@ -1105,6 +1110,16 @@ def _sessions_dirs_stamp() -> Tuple[Tuple[str, int], ...]:
             rows.append((str(d), int(d.stat().st_mtime_ns)))
         except Exception:
             continue
+        # Include subdirectories (archive, _archived_*, etc.) for stamp detection
+        try:
+            for sub in d.iterdir():
+                if sub.is_dir():
+                    try:
+                        rows.append((str(sub), int(sub.stat().st_mtime_ns)))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
     rows.sort(key=lambda x: x[0])
     return tuple(rows)
 
@@ -1126,6 +1141,8 @@ def _list_session_jsonl_files() -> List[str]:
         return cached_files
 
     files = glob.glob(str(AGENTS_DIR / "*" / "sessions" / "*.jsonl"))
+    # Also scan subdirectories (archive, _archived_*, etc.) for historical data
+    files += glob.glob(str(AGENTS_DIR / "*" / "sessions" / "*" / "*.jsonl"))
     with _daily_tokens_lock:
         _daily_tokens_cache.update({"files": files, "filesTs": now, "dirsStamp": dirs_stamp})
     return files
@@ -1427,7 +1444,7 @@ def _collect_daily_token_series(days: int = 30) -> List[Dict[str, Any]]:
     return rows
 
 
-def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
+def _collect_models_usage(days: int = 30) -> Dict[str, Any]:
     now = time.time()
     days = max(1, int(days or 1))
 
@@ -1499,8 +1516,19 @@ def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
     file_passive_map = _build_session_file_passive_map()
     jsonl_files = _list_session_jsonl_files()
 
+    # Pre-compute earliest timestamp for mtime-based early skip
+    start_ts = datetime.combine(start_day, datetime.min.time()).timestamp()
+
     for fp in jsonl_files:
         p = Path(fp)
+
+        # Skip files whose last modification is before the window start
+        try:
+            if p.stat().st_mtime < start_ts:
+                continue
+        except Exception:
+            pass
+
         is_passive_file = bool(file_passive_map.get(fp) or file_passive_map.get(str(p.resolve())))
 
         try:
@@ -1550,8 +1578,11 @@ def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
 
                     has_formula_fields = any(usage_obj.get(k) is not None for k in ("input", "output", "cacheRead"))
                     if has_formula_fields:
-                        net_input_tokens = max(0, raw_input_tokens - cache_read)
-                        consumed = net_input_tokens + max(0, output_tokens)
+                        # OpenClaw format: `input` is already net (excludes cacheRead & cacheWrite).
+                        # totalTokens = input + output + cacheRead + cacheWrite.
+                        # Actual consumed = input + cacheWrite + output = totalTokens - cacheRead.
+                        net_input_tokens = max(0, raw_input_tokens)
+                        consumed = net_input_tokens + max(0, cache_write) + max(0, output_tokens)
                     else:
                         consumed = _safe_int(usage_obj.get("totalTokens"))
                         net_input_tokens = max(0, consumed - max(0, output_tokens))
@@ -1641,7 +1672,7 @@ def _collect_models_usage(days: int = 15) -> Dict[str, Any]:
         "activeSessions": int(len(active_session_set)),
         "passiveSessions": int(len(passive_session_set)),
         "windowDays": int(days),
-        "formula": "Actual consumed tokens = net input + output; net input = max(0, input - cache reused) (per model call)",
+        "formula": "Actual consumed = input + cacheWrite + output = totalTokens - cacheRead (per model call)",
         "models": rows,
         "dailyTokens": daily_rows,
     }
@@ -2678,7 +2709,7 @@ def _empty_dashboard_payload() -> Dict[str, Any]:
             "passiveTokens": 0,
             "activeSessions": 0,
             "passiveSessions": 0,
-            "formula": "Actual consumed = net input + output; net input = max(0, input - cache reused)",
+            "formula": "Actual consumed = input + cacheWrite + output = totalTokens - cacheRead",
             "models": [],
             "dailyTokens": [],
         },
@@ -3782,7 +3813,7 @@ def _index_html(auth_token: Optional[str] = None) -> str:
       const models = (modelsData.models || []).filter(m => Number(m.tokens || 0) > 0);
       const metaEl = $('#token-consumption-meta');
       if (metaEl) {{
-        metaEl.textContent = `${{modelsData.formula || 'Actual tokens = net input + output; net input = max(0, input - cache reuse)'}} | ${{t('runningNow')}} ${{fmtNum(modelsData.activeTokens || 0)}} (${{fmtNum(modelsData.activeSessions || 0)}} sessions) | Passive ${{fmtNum(modelsData.passiveTokens || 0)}} (${{fmtNum(modelsData.passiveSessions || 0)}} sessions)`;
+        metaEl.textContent = `${{modelsData.formula || 'Actual consumed = input + cacheWrite + output = totalTokens - cacheRead'}} | ${{t('runningNow')}} ${{fmtNum(modelsData.activeTokens || 0)}} (${{fmtNum(modelsData.activeSessions || 0)}} sessions) | Passive ${{fmtNum(modelsData.passiveTokens || 0)}} (${{fmtNum(modelsData.passiveSessions || 0)}} sessions)`;
       }}
 
       $('#models-body').innerHTML = models.map(m => `
